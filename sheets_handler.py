@@ -13,8 +13,12 @@ carts_sheet = None
 def get_inventory():
     """Get current inventory from Google Sheets"""
     try:
+        if inventory_sheet is None:
+            print("DEBUG: inventory_sheet is None, using fallback data")
+            raise Exception("Inventory sheet not initialized")
+            
         records = inventory_sheet.get_all_records()
-        print(f"DEBUG: Found {len(records)} inventory records")
+        print(f"DEBUG: Found {len(records)} inventory records from Google Sheets")
         
         # Ensure numeric values are properly converted
         for record in records:
@@ -46,6 +50,7 @@ def get_inventory():
             {"Item Name": "Maggi Masala Noodles", "Category": "Food", "Quantity": 10, "Price (USD)": 1.99, "Description": "Instant masala noodles", "Tags": "noodles, instant, masala"},
             {"Item Name": "Tomato Ketchup", "Category": "Condiments", "Quantity": 8, "Price (USD)": 3.49, "Description": "Sweet and tangy tomato ketchup", "Tags": "ketchup, tomato, condiments"},
             {"Item Name": "Basmati Rice 5kg", "Category": "Grocery", "Quantity": 4, "Price (USD)": 15.99, "Description": "Premium long grain basmati rice", "Tags": "rice, basmati, grocery"},
+            {"Item Name": "Horse Gram 2 lb", "Category": "Grocery", "Quantity": 2, "Price (USD)": 4.89, "Description": "Protein-rich lentil", "Tags": "lentils, pulses, protein"},
         ]
         print("DEBUG: Using fallback inventory data")
         return fallback_data
@@ -93,6 +98,10 @@ def save_customer(customer_data):
 def save_cart(session_id, cart_data):
     """Save cart to Google Sheets"""
     try:
+        if carts_sheet is None:
+            print("DEBUG: carts_sheet is None, cannot save to Google Sheets")
+            return
+            
         carts = carts_sheet.get_all_records()
         
         # Find if cart already exists for this session
@@ -103,6 +112,7 @@ def save_cart(session_id, cart_data):
                 carts_sheet.update_cell(row_num, 2, cart_data.get("Customer Phone", ""))
                 carts_sheet.update_cell(row_num, 3, json.dumps(cart_data.get("Items", [])))
                 carts_sheet.update_cell(row_num, 4, datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+                print(f"DEBUG: Updated existing cart for session {session_id}")
                 return
         
         # Add new cart
@@ -112,8 +122,10 @@ def save_cart(session_id, cart_data):
             json.dumps(cart_data.get("Items", [])),
             datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         ])
+        print(f"DEBUG: Added new cart for session {session_id}")
     except Exception as e:
         print(f"Error saving cart: {e}")
+        print("DEBUG: Cart will only be stored locally")
 
 def load_cart(session_id):
     """Load cart from Google Sheets"""

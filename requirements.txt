@@ -1,6 +1,9 @@
-google-generativeai 
-python-dotenv 
-uvicorn 
-fastapi
-websockets
-python-multipart
+sentence-transformers==2.2.2
+scikit-learn==1.3.0
+numpy==1.24.3
+fastapi==0.104.1
+uvicorn==0.24.0
+python-dotenv==1.0.0
+gspread==5.12.0
+google-generativeai==0.3.2
+google-auth==2.23.4
