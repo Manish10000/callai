@@ -122,6 +122,13 @@ except Exception as e:
 # ---------------- Greeting ----------------
 WELCOME_GREETING = "नमस्ते! Welcome to GroceryBabu! I'm Aditi, your personal shopping assistant. You can ask me about products, add items to your cart, or place an order."
 
+# Multilingual greetings
+MULTILINGUAL_GREETINGS = {
+    "hi": "नमस्ते! GroceryBabu में आपका स्वागत है! मैं अदिति हूँ, आपकी व्यक्तिगत खरीदारी सहायक।",
+    "gu": "नमस्ते! GroceryBabu मां तमारुं स्वागत छे! हुं अदिति छूं, तमारी व्यक्तिगत खरीदारी सहायक।",
+    "en": "Hello! Welcome to GroceryBabu! I'm Aditi, your personal shopping assistant."
+}
+
 # ---------------- Gemini API ----------------
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 if not GOOGLE_API_KEY:
@@ -135,11 +142,127 @@ conversation_context = {}  # Store what user was looking at
 
 # Language mapping with appropriate voices
 LANGUAGE_MAP = {
-    "hi": {"code": "hi-IN", "voice": "Polly.Aditi"},
-    "gu": {"code": "hi-IN", "voice": "Polly.Aditi"},
-    "en": {"code": "en-IN", "voice": "Polly.Aditi"},
-    "default": {"code": "en-IN", "voice": "Polly.Aditi"}
+    "hi": {"code": "hi-IN", "voice": "Polly.Aditi"},  # Hindi - supported
+    "gu": {"code": "hi-IN", "voice": "Polly.Aditi"},  # Gujarati - use Hindi voice with Hindi script
+    "en": {"code": "en-IN", "voice": "Polly.Aditi"},  # English (India) - supported
+    "default": {"code": "en-IN", "voice": "Polly.Aditi"}  # Default to English
 }
+
+# Language prompts for gathering more input
+LANGUAGE_PROMPTS = {
+    "hi-IN": "और कुछ चाहिए?",
+    "gu-IN": "वधु कंयक जोयए?",  # Gujarati in Hindi script: "વધુ કંઈક જોઈએ?"
+    "en-IN": "Anything else?"
+}
+
+# Goodbye messages in different languages
+GOODBYE_MESSAGES = {
+    "hi-IN": "धन्यवाद! अलविदा!",
+    "gu-IN": "आभार! आवजो!",  # Gujarati in Hindi script: "આભાર! આવજો!"
+    "en-IN": "Thank you! Goodbye!"
+}
+
+def detect_language(text):
+    """Detect language from user input including transliterated text"""
+    text_lower = text.lower()
+    
+    # Gujarati detection patterns (both Gujarati script and transliterated)
+    gujarati_patterns = [
+        # Common Gujarati phrases
+        "kem cho", "su chale", "tamaro", "aapno", "chhe", "cho", 
+        "kevi rite", "saru", "nathi", "chhe ne", "khabar", "majama",
+        # Transliterated Gujarati words
+        "tame", "ame", "kevi", "kyan", "kyare", "kya", "su", "aa", "te",
+        "gujarati", "gujju", "ahmedabad", "surat", "vadodara"
+    ]
+    
+    # Hindi detection patterns (both Hindi script and transliterated)
+    hindi_patterns = [
+        # Common Hindi phrases
+        "kaise ho", "kya haal", "namaste", "dhanyawad", "theek hai", "acha hai",
+        "kaise hain", "kya kar rahe", "sab theek", "accha", "haan", "nahi",
+        # Transliterated Hindi words and phrases
+        "mujhe", "mujhko", "humko", "humein", "aapko", "aapke", "mere", "mera", "meri",
+        "kuch", "kuchh", "kharidna", "chahiye", "chahta", "chahti", "tha", "thi", "the",
+        "karna", "karne", "kiya", "kiye", "hai", "hain", "hoon", "ho", "hum", "tum",
+        "yeh", "woh", "yahan", "wahan", "kahan", "kab", "kyun", "kaise", "kitna",
+        "bahut", "thoda", "zyada", "kam", "accha", "bura", "sahi", "galat",
+        "paisa", "rupaye", "paise", "kitne", "kitna", "kitni",
+        "khana", "khaana", "peena", "pina", "lena", "dena", "jana", "aana",
+        "bhi", "bhe", "se", "me", "mein", "par", "pe", "ka", "ke", "ki", "ko",
+        "food", "grocery", "milk", "rice" # Common English words used in Hindi context
+    ]
+    
+    # Enhanced detection with word boundaries and context
+    gujarati_score = 0
+    hindi_score = 0
+    
+    words = text_lower.split()
+    
+    # Check for Gujarati patterns
+    for pattern in gujarati_patterns:
+        if pattern in text_lower:
+            gujarati_score += 2 if pattern in words else 1
+    
+    # Check for Hindi patterns  
+    for pattern in hindi_patterns:
+        if pattern in text_lower:
+            hindi_score += 2 if pattern in words else 1
+    
+    # Additional context-based detection
+    # Check for common Hindi sentence structures
+    if any(combo in text_lower for combo in ["mujhe chahiye", "mujhe kuch", "kya hai", "kaise hai", "kharidna hai", "lena hai"]):
+        hindi_score += 3
+    
+    # Check for common Gujarati sentence structures  
+    if any(combo in text_lower for combo in ["tamne kya", "ame kya", "su karvu", "kevi rite"]):
+        gujarati_score += 3
+    
+    # Return language based on highest score
+    if gujarati_score > hindi_score and gujarati_score > 0:
+        return "gu"
+    elif hindi_score > 0:
+        return "hi"
+    
+    # Default to English
+    return "en"
+
+# Test the language detection (for debugging)
+def test_language_detection():
+    """Test cases for language detection"""
+    test_cases = [
+        ("Mujhe kuchh food kharidna tha", "hi"),
+        ("Tame kya cho", "gu"), 
+        ("I want some groceries", "en"),
+        ("Aap kaise hain", "hi"),
+        ("Kem cho majama", "gu"),
+        ("Mujhe milk chahiye", "hi"),
+        ("Humko rice lena hai", "hi")
+    ]
+    
+    print("DEBUG: Language detection test results:")
+    for text, expected in test_cases:
+        detected = detect_language(text)
+        status = "✓" if detected == expected else "✗"
+        print(f"  {status} '{text}' → {detected} (expected: {expected})")
+
+# Uncomment to test: test_language_detection()
+
+def parse_language_response(response_text):
+    """Parse language-tagged response format"""
+    import re
+    
+    # Check if response has language tags
+    language_match = re.search(r'<language>(\w+)</language>', response_text)
+    response_match = re.search(r'<response>(.*?)</response>', response_text, re.DOTALL)
+    
+    if language_match and response_match:
+        detected_language = language_match.group(1)
+        clean_response = response_match.group(1).strip()
+        return detected_language, clean_response
+    
+    # If no tags, return default
+    return "en", response_text
 
 async def process_user_query(user_prompt, call_sid):
     """Process user query with function calling"""
@@ -231,7 +354,7 @@ async def process_user_query(user_prompt, call_sid):
     
     # Initialize the model with function declarations
     model = genai.GenerativeModel(
-        model_name='gemini-2.0-flash-exp',
+        model_name='gemini-1.5-flash',
         tools=function_declarations
     )
     
@@ -248,8 +371,11 @@ async def process_user_query(user_prompt, call_sid):
                 "customer_phone": existing_cart["Customer Phone"]
             }
     
+    # Detect user's language
+    detected_language = detect_language(user_prompt)
+    
     # Prepare the prompt with context and instructions
-    system_instructions = """You are Aditi, a helpful grocery store assistant at GroceryBabu. ALWAYS use the available functions when appropriate:
+    system_instructions = f"""You are Aditi, a helpful grocery store assistant at GroceryBabu. ALWAYS use the available functions when appropriate:
 
     - When user asks about products/items/groceries (like "what do you have", "show me products", "grocery available") → USE search_products function
     - When user wants to add items WITH quantity (like "I want 2 milk biscuits") → USE add_to_cart function  
@@ -272,6 +398,32 @@ async def process_user_query(user_prompt, call_sid):
     - "What's my car price?" = "What's my cart total?" → USE get_cart_summary
     - "Car items" = "Cart items" → USE get_cart_summary
     - Always assume grocery/food context, never automotive
+
+    LANGUAGE RESPONSE FORMAT:
+    ALWAYS format your response as: <language>language_code</language><response>Your response here</response>
+    
+    Detected user language: {detected_language}
+    
+    IMPORTANT LANGUAGE DETECTION RULES:
+    - Detect Hindi even when written in English script (transliterated): "Mujhe kuchh food kharidna tha" = Hindi
+    - Detect Gujarati even when written in English script: "Tame kya cho" = Gujarati  
+    - Look for Hindi words: mujhe, kuch, chahiye, kharidna, tha, hai, hoon, aap, etc.
+    - Look for Gujarati words: tame, ame, chhe, cho, su, kya, etc.
+    
+    Response Language Rules:
+    - If user speaks Gujarati (script or transliterated) → respond in Gujarati using Hindi script, use "gu"
+    - If user speaks Hindi (script or transliterated) → respond in Hindi using Devanagari script, use "hi"  
+    - If user speaks English → respond in English, use "en"
+    
+    Examples:
+    User: "Mujhe kuchh food kharidna tha" (Hindi in English script)
+    Response: <language>hi</language><response>आपको कौन सा खाना चाहिए? मैं आपकी मदद कर सकती हूँ।</response>
+    
+    User: "Tame kya cho?" (Gujarati in English script)  
+    Response: <language>gu</language><response>हुं मजामां छूं! तमने कंयक जोयए?</response>
+    
+    User: "I want some groceries" (English)
+    Response: <language>en</language><response>I can help you find groceries! What are you looking for?</response>
 
     Be conversational and natural. Keep responses short and friendly. You can introduce yourself as Aditi when appropriate."""
     
@@ -552,11 +704,13 @@ async def process_user_query(user_prompt, call_sid):
                 elif any(product in user_prompt.lower() for product in ["chora", "black eyed", "peas"]):
                     response_text = "How many Chora Black Eyed Peas 4 lb would you like to add?"
         
-        # Add to conversation history
-        add_to_conversation_history(call_sid, "assistant", response_text)
+        # Parse language from response if available
+        detected_lang, clean_response = parse_language_response(response_text)
         
-        # Default to English for now since function calling doesn't provide language info
-        return "en", response_text
+        # Add to conversation history
+        add_to_conversation_history(call_sid, "assistant", clean_response)
+        
+        return detected_lang, clean_response
     
     except Exception as e:
         print(f"Error processing query with Gemini: {e}")
@@ -582,21 +736,39 @@ async def process_user_query(user_prompt, call_sid):
         else:
             response_text = "I'm sorry, I didn't understand that. Could you please repeat?"
         
-        add_to_conversation_history(call_sid, "assistant", response_text)
-        return "en", response_text
+        # Detect language for fallback responses too
+        fallback_lang = detect_language(user_prompt)
+        
+        # Format fallback response with language tags
+        if fallback_lang == "hi":
+            response_text = f"<language>hi</language><response>माफ़ करें, मुझे समझ नहीं आया। कृपया दोबारा कहें।</response>"
+        elif fallback_lang == "gu":
+            response_text = f"<language>gu</language><response>माफ करजो, हुं समजयो नहीं। कृपया फरी कहो।</response>"
+        else:
+            response_text = f"<language>en</language><response>{response_text}</response>"
+        
+        detected_lang, clean_response = parse_language_response(response_text)
+        add_to_conversation_history(call_sid, "assistant", clean_response)
+        return detected_lang, clean_response
 
 # ---------------- FastAPI app ----------------
 app = FastAPI()
 
+# Store retry counts for each call
+call_retry_counts = {}
+
 @app.post("/twiml")
 async def twiml_endpoint():
     """Return TwiML for Twilio"""
+    # Use a safe greeting without quotes for XML
+    safe_greeting = "Namaste! Welcome to GroceryBabu! I am Aditi, your personal shopping assistant. You can ask me about products, add items to your cart, or place an order."
+    
     xml_response = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
     <Gather input="speech" language="en-IN" action="https://{DOMAIN}/handle-speech" speechTimeout="auto" enhanced="true">
-        <Say voice="Polly.Aditi">{WELCOME_GREETING}</Say>
+        <Say voice="Polly.Aditi">{safe_greeting}</Say>
     </Gather>
-    <Say voice="Polly.Aditi">I didn't hear anything. Please call back again.</Say>
+    <Say voice="Polly.Aditi">I did not hear anything. Please call back again.</Say>
 </Response>"""
     
     return Response(content=xml_response, media_type="text/xml")
@@ -610,8 +782,51 @@ async def handle_speech(request: Request):
     
     print(f"Received speech from {call_sid}: {speech_result}")
     
+    # Handle empty or unclear speech with retry logic
+    if not speech_result or speech_result.strip() == "":
+        # Initialize retry count if not exists
+        if call_sid not in call_retry_counts:
+            call_retry_counts[call_sid] = 0
+        
+        call_retry_counts[call_sid] += 1
+        
+        if call_retry_counts[call_sid] <= 2:
+            # Allow up to 2 retries
+            retry_messages = {
+                1: "I did not hear you clearly. Please speak again.",
+                2: "I am still having trouble hearing you. Please try once more."
+            }
+            
+            retry_message = retry_messages[call_retry_counts[call_sid]]
+            
+            xml_response = f"""<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Say voice="Polly.Aditi">{retry_message}</Say>
+    <Gather input="speech" language="en-IN" action="https://{DOMAIN}/handle-speech" speechTimeout="auto" enhanced="true">
+        <Say voice="Polly.Aditi">Please tell me how I can help you.</Say>
+    </Gather>
+    <Say voice="Polly.Aditi">I am sorry, I could not hear you. Please call back later.</Say>
+    <Hangup/>
+</Response>"""
+            return Response(content=xml_response, media_type="text/xml")
+        else:
+            # After 2 retries, end the call
+            xml_response = f"""<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Say voice="Polly.Aditi">I am sorry, I am having trouble hearing you. Please try calling again later. Thank you for calling GroceryBabu.</Say>
+    <Hangup/>
+</Response>"""
+            # Clean up retry count
+            if call_sid in call_retry_counts:
+                del call_retry_counts[call_sid]
+            return Response(content=xml_response, media_type="text/xml")
+    
+    # Reset retry count on successful speech recognition
+    if call_sid in call_retry_counts:
+        del call_retry_counts[call_sid]
+    
     # Process the user query
-    detected_language, response_text = await process_user_query(speech_result, call_sid)
+    detected_language, clean_response = await process_user_query(speech_result, call_sid)
     
     # Map to Twilio language code and voice
     language_info = LANGUAGE_MAP.get(detected_language, LANGUAGE_MAP["default"])
@@ -619,24 +834,62 @@ async def handle_speech(request: Request):
     voice = language_info["voice"]
     
     print(f"Detected language: {detected_language} -> Twilio: {detected_language_code}, Voice: {voice}")
-    print(f"Response: {response_text}")
+    print(f"Response: {clean_response}")
     
     # Check if this is a goodbye message to end the call
-    if any(word in response_text.lower() for word in ["goodbye", "thank you", "end call", "have a great day"]):
+    if any(word in clean_response.lower() for word in ["goodbye", "thank you", "end call", "have a great day", "alvida", "dhanyawad"]):
         xml_response = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-    <Say voice="{voice}">{response_text}</Say>
+    <Say voice="{voice}">{clean_response}</Say>
     <Hangup/>
 </Response>"""
+        # Clean up retry count and context
+        if call_sid in call_retry_counts:
+            del call_retry_counts[call_sid]
+        if call_sid in conversation_context:
+            del conversation_context[call_sid]
     else:
+        # Determine if we should ask for more input based on context
+        should_prompt = True
+        continue_prompt = ""
+        
+        # Don't ask "anything else" during order process
+        order_keywords = ["name", "phone", "address", "order", "place", "checkout", "delivery", "need your", "provide"]
+        if any(keyword in clean_response.lower() for keyword in order_keywords):
+            should_prompt = False
+        
+        # Don't ask "anything else" when asking for quantity or confirmation
+        elif any(phrase in clean_response.lower() for phrase in ["how many", "quantity", "would you like", "do you want", "which one"]):
+            should_prompt = False
+        
+        # Don't ask "anything else" when showing products or asking for selection
+        elif any(phrase in clean_response.lower() for phrase in ["i found", "here are", "which", "select", "choose"]):
+            should_prompt = False
+        
+        # Don't ask "anything else" when there's a question in the response
+        elif "?" in clean_response:
+            should_prompt = False
+        
+        # Use appropriate continue prompt based on language and context
+        if should_prompt:
+            continue_prompt = LANGUAGE_PROMPTS.get(detected_language_code, "Please continue, I am listening.")
+        else:
+            # Just simple listening prompt without "anything else"
+            simple_prompts = {
+                "hi-IN": "मैं सुन रहा हूँ।",
+                "gu-IN": "हुं सांभळूं छूं।",
+                "en-IN": "I am listening."
+            }
+            continue_prompt = simple_prompts.get(detected_language_code, "I am listening.")
+        
         # Return TwiML with dynamic language switching
         xml_response = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-    <Say voice="{voice}">{response_text}</Say>
+    <Say voice="{voice}">{clean_response}</Say>
     <Gather input="speech" language="{detected_language_code}" action="https://{DOMAIN}/handle-speech" speechTimeout="auto" enhanced="true">
-        <Say voice="{voice}">Please continue, I'm listening.</Say>
+        <Say voice="{voice}">{continue_prompt}</Say>
     </Gather>
-    <Say voice="{voice}">I didn't hear anything. Please call back if you need assistance.</Say>
+    <Say voice="{voice}">I did not hear anything. Please call back if you need assistance.</Say>
     <Hangup/>
 </Response>"""
     
