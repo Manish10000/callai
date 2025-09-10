@@ -21,10 +21,12 @@ WELCOME_GREETING = "नमस्ते! Hi! Hello! मैं एक वॉइस
 # ---------------- System Prompt ----------------
 SYSTEM_PROMPT = """You are a helpful and friendly multilingual voice assistant. This conversation is happening over a phone call, so your responses will be spoken aloud. You must support Hindi, English, and Gujarati naturally, depending on what the user speaks.
 
+IMPORTANT: For Gujarati responses, write the Gujarati words using Hindi script (Devanagari) but keep the Gujarati pronunciation and vocabulary. This is because the text-to-speech system can read Hindi script but not Gujarati script.
+
 Rules:
 1. First, detect the language of the user's query from: Hindi, English, or Gujarati
 2. Respond in the same language as the user's query
-3. Even if the text is in English but the content is in Hindi or Gujarati, respond in Hindi or Gujarati respectively
+3. For Gujarati content, use Hindi script but keep Gujarati words and pronunciation
 4. Always keep sentences short, clear, and natural for spoken conversation
 5. Spell out numbers in words (e.g., 'एक हज़ार दो सौ' instead of 1200)
 6. Do not use any special characters like *, •, or emojis
@@ -34,9 +36,9 @@ Response format:
 <language>language_code</language>
 <response>Your response here</response>
 
-Example for Gujarati:
+Example for Gujarati (using Hindi script):
 User: "Kem cho?"
-Response: "<language>gu</language><response>હું મજામાં છું, આભાર! તમારો દિવસ કેવો ચાલી રહ્યો છે?</response>"
+Response: "<language>gu</language><response>हूं मजामां छूं! आभार! तमारो दिवस कैवो चाली रहयो छे?</response>"
 
 Example for Hindi:
 User: "Aap kaise ho?"
@@ -62,25 +64,25 @@ model = genai.GenerativeModel(
 # Store active chat sessions
 sessions = {}
 
-# Language mapping
+# Language mapping with appropriate voices - Using Hindi voice for Gujarati
 LANGUAGE_MAP = {
-    "hi": "hi-IN",  # Hindi
-    "gu": "gu-IN",  # Gujarati
-    "en": "en-IN",  # English (India)
-    "default": "en-IN"  # Default to English
+    "hi": {"code": "hi-IN", "voice": "Polly.Aditi"},  # Hindi - supported
+    "gu": {"code": "hi-IN", "voice": "Polly.Aditi"},  # Gujarati - use Hindi voice with Hindi script
+    "en": {"code": "en-IN", "voice": "Polly.Aditi"},  # English (India) - supported
+    "default": {"code": "en-IN", "voice": "Polly.Aditi"}  # Default to English
 }
 
 # Language prompts for gathering more input
 LANGUAGE_PROMPTS = {
     "hi-IN": "और कुछ पूछना चाहते हैं?",
-    "gu-IN": "વધુ કંઈક પૂછવું છે?",
+    "gu-IN": "वधु कंयक पूछवुं छे?",  # Gujarati in Hindi script: "વધુ કંઈક પૂછવું છે?"
     "en-IN": "Would you like to ask anything else?"
 }
 
 # Goodbye messages in different languages
 GOODBYE_MESSAGES = {
     "hi-IN": "धन्यवाद! अलविदा!",
-    "gu-IN": "આભાર! આવજો!",
+    "gu-IN": "आभार! आवजो!",  # Gujarati in Hindi script: "આભાર! આવજો!"
     "en-IN": "Thank you! Goodbye!"
 }
 
@@ -137,10 +139,12 @@ async def handle_speech(request: Request):
     chat_session = sessions[call_sid]
     detected_language, response_text = await gemini_response_with_language(chat_session, speech_result)
     
-    # Map to Twilio language code
-    detected_language_code = LANGUAGE_MAP.get(detected_language, LANGUAGE_MAP["default"])
+    # Map to Twilio language code and voice - Using Hindi voice for Gujarati
+    language_info = LANGUAGE_MAP.get(detected_language, LANGUAGE_MAP["default"])
+    detected_language_code = language_info["code"]
+    voice = language_info["voice"]
     
-    print(f"Gemini detected language: {detected_language} -> Twilio: {detected_language_code}")
+    print(f"Gemini detected language: {detected_language} -> Twilio: {detected_language_code}, Voice: {voice}")
     print(f"Response text to be spoken: {response_text}")
     
     # Get appropriate prompts for the detected language
@@ -150,15 +154,15 @@ async def handle_speech(request: Request):
     # Return TwiML with dynamic language switching
     xml_response = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-    <Say voice="Polly.Aditi">{response_text}</Say>
+    <Say voice="{voice}">{response_text}</Say>
     <Gather input="speech" language="{detected_language_code}" action="https://{DOMAIN}/handle-speech" speechTimeout="auto" enhanced="true">
-        <Say voice="Polly.Aditi">{gather_prompt}</Say>
+        <Say voice="{voice}">{gather_prompt}</Say>
     </Gather>
-    <Say voice="Polly.Aditi">{goodbye_message}</Say>
+    <Say voice="{voice}">{goodbye_message}</Say>
     <Hangup/>
 </Response>"""
     
-    print(f"Using language: {detected_language_code} for call {call_sid}")
+    print(f"Using language: {detected_language_code} with voice: {voice} for call {call_sid}")
     
     return Response(content=xml_response, media_type="text/xml")
 
@@ -172,4 +176,5 @@ if __name__ == "__main__":
     print(f"  - Main endpoint: {DOMAIN}/twiml")
     print(f"  - Speech handler: {DOMAIN}/handle-speech")
     print("Language detection enabled using Gemini AI")
+    print("Note: Gujarati content is written in Hindi script for TTS compatibility")
     uvicorn.run(app, host="0.0.0.0", port=PORT)
