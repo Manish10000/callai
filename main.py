@@ -275,44 +275,7 @@ async def process_user_query(user_prompt, call_sid):
     # Handle context-aware responses
     user_lower = user_prompt.lower().strip()
     
-    # Fix common speech-to-text errors for grocery context
-    speech_corrections = {
-        # Cart vs Car confusion
-        "car price": "cart price",
-        "car total": "cart total", 
-        "my car": "my cart",
-        "the car": "the cart",
-        "car summary": "cart summary",
-        "car items": "cart items",
-        "what's in my car": "what's in my cart",
-        "car contents": "cart contents",
-        "car cost": "cart cost",
-        "car amount": "cart amount",
-        "know what is my car": "what is my cart",
-        "what is my car": "what is my cart",
-        
-        # Common product name corrections
-        "milk vicks": "milk bikis",
-        "milk wicks": "milk bikis", 
-        "milk wickets": "milk bikis",
-        "milk best": "milk bikis",
-        
-        # Other common errors
-        "type of them": "two of them",
-        "wife of the": "five of them",
-        "tour of": "two of",
-        "auto": "two",
-        "offline": "all fine"
-    }
-    
-    # Apply corrections
-    original_prompt = user_prompt
-    for wrong, correct in speech_corrections.items():
-        if wrong in user_lower:
-            user_prompt = user_prompt.replace(wrong, correct)
-            user_lower = user_prompt.lower().strip()
-            print(f"DEBUG: Speech correction: '{original_prompt}' → '{user_prompt}'")
-            break
+
     
     # Check for simple confirmations
     if user_lower in ["yes", "yeah", "yep", "sure", "ok", "okay"]:
@@ -321,16 +284,46 @@ async def process_user_query(user_prompt, call_sid):
             ctx = conversation_context[call_sid]
             if ctx.get("action") == "add_to_cart" and ctx.get("product"):
                 # They want to add the product we just showed them - but ask for quantity
-                user_prompt = f"User wants to add {ctx['product']} - ask for quantity"
+                user_prompt = f"User wants to add {ctx['product']} - ask for quantity first"
                 print(f"DEBUG: Context-aware: User confirmed adding {ctx['product']}, need to ask quantity")
             elif ctx.get("action") == "ask_quantity" and ctx.get("product"):
                 # They confirmed but we need quantity
                 user_prompt = f"How many {ctx['product']} do you want?"
                 print(f"DEBUG: Context-aware: Need quantity for {ctx['product']}")
     
-    # Check for quantity responses (but not phone numbers)
-    elif (any(num in user_lower for num in ["one", "two", "three", "four", "five", "1", "2", "3", "4", "5"]) and 
+    # Check for product selection responses (like "second one", "first", "number 2")
+    elif any(word in user_lower for word in ["first", "second", "third", "1st", "2nd", "3rd", "number 1", "number 2", "number 3"]) and len(user_prompt.split()) <= 3:
+        # This looks like a product selection - extract which item they want
+        recent_messages = conversation_history.get(call_sid, [])[-2:]
+        product_list_shown = False
+        selected_product = None
+        
+        for msg in recent_messages:
+            if msg.get("role") == "assistant" and any(indicator in msg.get("content", "") for indicator in ["1.", "2.", "3.", "Which one would you like"]):
+                product_list_shown = True
+                # Extract the product names from the message
+                import re
+                products = re.findall(r'\d+\.\s*([^(]+)', msg.get("content", ""))
+                
+                # Determine which product they selected
+                if "first" in user_lower or "1" in user_lower:
+                    selected_product = products[0].strip() if len(products) > 0 else None
+                elif "second" in user_lower or "2" in user_lower:
+                    selected_product = products[1].strip() if len(products) > 1 else None
+                elif "third" in user_lower or "3" in user_lower:
+                    selected_product = products[2].strip() if len(products) > 2 else None
+                break
+        
+        if product_list_shown and selected_product:
+            user_prompt = f"User selected {selected_product}. Ask how many they want before adding to cart."
+            print(f"DEBUG: Context-aware product selection: User selected '{selected_product}' - will ask for quantity")
+        else:
+            print(f"DEBUG: Detected product selection: '{user_prompt}' - will ask for quantity after selection")
+    
+    # Check for quantity responses (but not phone numbers or product selections)
+    elif (any(num in user_lower for num in ["1", "2", "3", "4", "5"]) and 
           not any(phone_word in user_lower for phone_word in ["phone", "number", "contact", "mobile"]) and
+          not any(selection_word in user_lower for selection_word in ["first", "second", "third", "1st", "2nd", "3rd"]) and
           len(user_prompt.replace(" ", "")) < 10):  # Phone numbers are usually longer
         if call_sid in conversation_context and conversation_context[call_sid].get("product"):
             product = conversation_context[call_sid]["product"]
@@ -375,58 +368,58 @@ async def process_user_query(user_prompt, call_sid):
     detected_language = detect_language(user_prompt)
     
     # Prepare the prompt with context and instructions
-    system_instructions = f"""You are Aditi, a helpful grocery store assistant at GroceryBabu. ALWAYS use the available functions when appropriate:
+    system_instructions = f"""You are Aditi, a helpful grocery assistant at GroceryBabu. Follow these rules:
 
-    - When user asks about products/items/groceries (like "what do you have", "show me products", "grocery available") → USE search_products function
-    - When user wants to add items WITH quantity (like "I want 2 milk biscuits") → USE add_to_cart function  
-    - When user wants to add items WITHOUT quantity (like "I want milk biscuits") → ASK for quantity, don't assume 1
-    - When user wants to remove items → USE remove_from_cart function
-    - When user asks about cart → USE get_cart_summary function
-    - When user wants to order → USE place_order function
+        --- PRODUCT ACTIONS ---
+        - Show products → use search_products
+        - Add item (with qty) → use add_to_cart
+        - Add item (no qty) → ask for qty first
+        - Remove item → use remove_from_cart
+        - Cart details/summary/total → use get_cart_summary
+        - Place order → use place_order
 
-    IMPORTANT CONTEXT RULES:
-    - If user says "yes/yeah/sure" after you showed them a product, they want to add it - ASK FOR QUANTITY
-    - If user gives a number after asking "how many", use add_to_cart with that quantity
-    - Remember what product you just discussed
-    - When collecting order info, recognize: names (like "Sanjay Patra"), phone numbers (like "7750 944 643"), addresses
-    - Don't suggest products that are already in the cart
-    - NEVER assume quantity = 1, always ask if not provided
+        --- QUANTITY RULES ---
+        - Never add without explicit qty
+        - If user picks from list (e.g., "first", "second") → don’t search again, just ask "How many [product]?"
+        - If user says "yes/sure" → ask qty before adding
+        - Only call add_to_cart after qty given
+        - Remember last discussed product
 
-    SPEECH RECOGNITION ERROR HANDLING:
-    - If user mentions "car price/total/cost" they likely mean "cart price/total/cost" (shopping cart)
-    - We are a GROCERY store, we don't sell cars - interpret car-related queries as cart-related
-    - "What's my car price?" = "What's my cart total?" → USE get_cart_summary
-    - "Car items" = "Cart items" → USE get_cart_summary
-    - Always assume grocery/food context, never automotive
+        --- ORDER INFO ---
+        - Recognize names, phone numbers, and addresses when user shares them
+        - Don’t suggest items already in cart
 
-    LANGUAGE RESPONSE FORMAT:
-    ALWAYS format your response as: <language>language_code</language><response>Your response here</response>
-    
-    Detected user language: {detected_language}
-    
-    IMPORTANT LANGUAGE DETECTION RULES:
-    - Detect Hindi even when written in English script (transliterated): "Mujhe kuchh food kharidna tha" = Hindi
-    - Detect Gujarati even when written in English script: "Tame kya cho" = Gujarati  
-    - Look for Hindi words: mujhe, kuch, chahiye, kharidna, tha, hai, hoon, aap, etc.
-    - Look for Gujarati words: tame, ame, chhe, cho, su, kya, etc.
-    
-    Response Language Rules:
-    - If user speaks Gujarati (script or transliterated) → respond in Gujarati using Hindi script, use "gu"
-    - If user speaks Hindi (script or transliterated) → respond in Hindi using Devanagari script, use "hi"  
-    - If user speaks English → respond in English, use "en"
-    
-    Examples:
-    User: "Mujhe kuchh food kharidna tha" (Hindi in English script)
-    Response: <language>hi</language><response>आपको कौन सा खाना चाहिए? मैं आपकी मदद कर सकती हूँ।</response>
-    
-    User: "Tame kya cho?" (Gujarati in English script)  
-    Response: <language>gu</language><response>हुं मजामां छूं! तमने कंयक जोयए?</response>
-    
-    User: "I want some groceries" (English)
-    Response: <language>en</language><response>I can help you find groceries! What are you looking for?</response>
+        --- SPEECH ERRORS (Auto-correct) ---
+        - "car" = "cart" (car price → cart price, my car → my cart, etc.)
+        - "milk vicks/wicks/wickets/best" = "milk bikis"
+        - Qty corrections: 
+        - "type of them" = "two of them"
+        - "wife of the" = "five of them"
+        - "tour of" = "two of"
+        - "auto" = "two"
+        - "offline" = "all fine"
 
-    Be conversational and natural. Keep responses short and friendly. You can introduce yourself as Aditi when appropriate."""
-    
+        --- LANGUAGE HANDLING ---
+        Detect user language:
+        - Hindi words (mujhe, chahiye, kharidna, etc.) → respond in Hindi (code: hi)
+        - Gujarati words (tame, cho, chhe, etc.) → respond in Gujarati (code: gu)
+        - Otherwise → respond in English (code: en)
+        - Transliterated Hindi/Gujarati → treat as native language
+
+        Response format:
+        <language>[code]</language><response>[reply]</response>
+
+        Examples:
+        User: "Mujhe kuchh kharidna tha"
+        → <language>hi</language><response>आपको क्या चाहिए?</response>
+
+        User: "Tame kya cho?"
+        → <language>gu</language><response>हुं मजामा छूं! तमने शुं जोयए?</response>
+
+        User: "I want some groceries"
+        → <language>en</language><response>I can help you! What do you need?</response>
+        """
+
     # Add current context if available
     context_info = ""
     if call_sid in conversation_context:
@@ -438,7 +431,15 @@ async def process_user_query(user_prompt, call_sid):
             elif ctx.get("action") == "ask_quantity":
                 context_info += "You asked for quantity."
     
-    full_prompt = f"{system_instructions}\n\n{context}{context_info}\n\nUser: {user_prompt}"
+    # Check if we just showed a product list
+    recent_messages = conversation_history.get(call_sid, [])[-2:]
+    product_list_context = ""
+    for msg in recent_messages:
+        if msg.get("role") == "assistant" and any(indicator in msg.get("content", "") for indicator in ["1.", "2.", "3.", "Which one would you like"]):
+            product_list_context = f"\nPRODUCT LIST CONTEXT: You just showed a numbered list of products. If user says 'first', 'second', etc., they are selecting from YOUR list - don't search again!"
+            break
+    
+    full_prompt = f"{system_instructions}\n\n{context}{context_info}{product_list_context}\n\nUser: {user_prompt}"
     
     try:
         # Send the message to Gemini
@@ -510,24 +511,24 @@ async def process_user_query(user_prompt, call_sid):
                         elif len(results) == 1 or (len(results) > 1 and results[0].get('similarity_score', 0) > 0.5):
                             # Single product found OR very high similarity match - make it easy to add
                             item = results[0]
-                            response_text = f"I found {item['Item Name']} for ${item['Price (USD)']}. We have {item['Quantity']} available. Would you like to add this to your cart?"
+                            response_text = f"I found {item['Item Name']} for ${item['Price (USD)']}. We have {item['Quantity']} available. How many would you like?"
                             
-                            # Store context for next interaction
+                            # Store context for next interaction - ask for quantity
                             conversation_context[call_sid] = {
-                                "action": "add_to_cart",
+                                "action": "ask_quantity",
                                 "product": item['Item Name'],
                                 "price": item['Price (USD)'],
                                 "available": item['Quantity']
                             }
                         elif len(results) > 5:
                             response_text = f"I found {len(results)} products. Here are some popular ones: "
-                            for item in results[:3]:  # Show only top 3
-                                response_text += f"{item['Item Name']} (${item['Price (USD)']}), "
+                            for i, item in enumerate(results[:3], 1):  # Show only top 3 with numbers
+                                response_text += f"{i}. {item['Item Name']} (${item['Price (USD)']}), "
                             response_text += "Which one would you like?"
                         else:
                             response_text = f"I found these products: "
-                            for item in results[:3]:  # Show top 3 results
-                                response_text += f"{item['Item Name']} (${item['Price (USD)']}), "
+                            for i, item in enumerate(results[:3], 1):  # Show top 3 results with numbers
+                                response_text += f"{i}. {item['Item Name']} (${item['Price (USD)']}), "
                             response_text += "Which one would you like?"
                     else:
                         # Try to find similar products using vector search
@@ -554,16 +555,48 @@ async def process_user_query(user_prompt, call_sid):
             
             elif function_name == "add_to_cart":
                 product_name = args.get("product_name", "")
-                quantity = args.get("quantity", 1)
+                quantity = args.get("quantity", None)
                 
-                # Get customer phone if available
-                customer_phone = None
-                if call_sid in customer_info and "phone" in customer_info[call_sid]:
-                    customer_phone = customer_info[call_sid]["phone"]
-                elif call_sid in shopping_carts and "customer_phone" in shopping_carts[call_sid]:
-                    customer_phone = shopping_carts[call_sid]["customer_phone"]
-                
-                success, response_text = add_to_cart(call_sid, product_name, quantity, customer_phone)
+                # Check if quantity was explicitly provided
+                if quantity is None or quantity == 1.0:
+                    # Check if this was a proper quantity request or just a default
+                    recent_messages = conversation_history.get(call_sid, [])[-2:]
+                    quantity_was_asked = any("how many" in msg.get("content", "").lower() for msg in recent_messages if msg.get("role") == "assistant")
+                    
+                    if not quantity_was_asked:
+                        # Ask for quantity instead of adding
+                        response_text = f"How many {product_name} would you like to add to your cart?"
+                        
+                        # Store context for quantity
+                        conversation_context[call_sid] = {
+                            "action": "ask_quantity",
+                            "product": product_name,
+                            "price": "N/A",
+                            "available": "N/A"
+                        }
+                        
+                        # Don't execute add_to_cart, just ask for quantity
+                        success = False
+                    else:
+                        # Quantity was asked and user responded, proceed with add
+                        # Get customer phone if available
+                        customer_phone = None
+                        if call_sid in customer_info and "phone" in customer_info[call_sid]:
+                            customer_phone = customer_info[call_sid]["phone"]
+                        elif call_sid in shopping_carts and "customer_phone" in shopping_carts[call_sid]:
+                            customer_phone = shopping_carts[call_sid]["customer_phone"]
+                        
+                        success, response_text = add_to_cart(call_sid, product_name, quantity, customer_phone)
+                else:
+                    # Explicit quantity provided, proceed with add
+                    # Get customer phone if available
+                    customer_phone = None
+                    if call_sid in customer_info and "phone" in customer_info[call_sid]:
+                        customer_phone = customer_info[call_sid]["phone"]
+                    elif call_sid in shopping_carts and "customer_phone" in shopping_carts[call_sid]:
+                        customer_phone = shopping_carts[call_sid]["customer_phone"]
+                    
+                    success, response_text = add_to_cart(call_sid, product_name, quantity, customer_phone)
                 
                 # Clear context after successful add
                 if success and call_sid in conversation_context:
@@ -768,7 +801,12 @@ async def twiml_endpoint():
     <Gather input="speech" language="en-IN" action="https://{DOMAIN}/handle-speech" speechTimeout="auto" enhanced="true">
         <Say voice="Polly.Aditi">{safe_greeting}</Say>
     </Gather>
-    <Say voice="Polly.Aditi">I did not hear anything. Please call back again.</Say>
+    <Say voice="Polly.Aditi">I did not hear anything. Let me try again.</Say>
+    <Gather input="speech" language="en-IN" action="https://{DOMAIN}/handle-speech" speechTimeout="auto" enhanced="true">
+        <Say voice="Polly.Aditi">Please tell me how I can help you.</Say>
+    </Gather>
+    <Say voice="Polly.Aditi">I am sorry, I am having trouble hearing you. Please try calling again later. Thank you for calling GroceryBabu.</Say>
+    <Hangup/>
 </Response>"""
     
     return Response(content=xml_response, media_type="text/xml")
@@ -783,18 +821,24 @@ async def handle_speech(request: Request):
     print(f"Received speech from {call_sid}: {speech_result}")
     
     # Handle empty or unclear speech with retry logic
-    if not speech_result or speech_result.strip() == "":
+    # Only treat as unclear if it's truly empty or very short unclear sounds
+    unclear_speech_indicators = ["", "um", "uh", "hmm"]
+    is_unclear = (not speech_result or 
+                  speech_result.strip() == "" or 
+                  (speech_result.strip().lower() in unclear_speech_indicators and len(speech_result.strip()) <= 3))
+    
+    if is_unclear:
         # Initialize retry count if not exists
         if call_sid not in call_retry_counts:
             call_retry_counts[call_sid] = 0
         
         call_retry_counts[call_sid] += 1
         
-        if call_retry_counts[call_sid] <= 2:
-            # Allow up to 2 retries
+        if call_retry_counts[call_sid] <= 3:  # Allow up to 3 retries
             retry_messages = {
                 1: "I did not hear you clearly. Please speak again.",
-                2: "I am still having trouble hearing you. Please try once more."
+                2: "I am still having trouble hearing you. Please try once more.",
+                3: "Let me try one more time. Please speak clearly."
             }
             
             retry_message = retry_messages[call_retry_counts[call_sid]]
@@ -805,12 +849,16 @@ async def handle_speech(request: Request):
     <Gather input="speech" language="en-IN" action="https://{DOMAIN}/handle-speech" speechTimeout="auto" enhanced="true">
         <Say voice="Polly.Aditi">Please tell me how I can help you.</Say>
     </Gather>
-    <Say voice="Polly.Aditi">I am sorry, I could not hear you. Please call back later.</Say>
+    <Say voice="Polly.Aditi">I still cannot hear you clearly. Let me try once more.</Say>
+    <Gather input="speech" language="en-IN" action="https://{DOMAIN}/handle-speech" speechTimeout="auto" enhanced="true">
+        <Say voice="Polly.Aditi">Please speak clearly and tell me what you need.</Say>
+    </Gather>
+    <Say voice="Polly.Aditi">I am sorry, I am having trouble hearing you. Please try calling again later. Thank you for calling GroceryBabu.</Say>
     <Hangup/>
 </Response>"""
             return Response(content=xml_response, media_type="text/xml")
         else:
-            # After 2 retries, end the call
+            # After 3 retries, end the call
             xml_response = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
     <Say voice="Polly.Aditi">I am sorry, I am having trouble hearing you. Please try calling again later. Thank you for calling GroceryBabu.</Say>
@@ -889,7 +937,11 @@ async def handle_speech(request: Request):
     <Gather input="speech" language="{detected_language_code}" action="https://{DOMAIN}/handle-speech" speechTimeout="auto" enhanced="true">
         <Say voice="{voice}">{continue_prompt}</Say>
     </Gather>
-    <Say voice="{voice}">I did not hear anything. Please call back if you need assistance.</Say>
+    <Say voice="{voice}">I did not hear you. Let me ask again.</Say>
+    <Gather input="speech" language="{detected_language_code}" action="https://{DOMAIN}/handle-speech" speechTimeout="auto" enhanced="true">
+        <Say voice="{voice}">Please tell me what you need.</Say>
+    </Gather>
+    <Say voice="{voice}">I am sorry, I am having trouble hearing you. Please try calling again later. Thank you for calling GroceryBabu.</Say>
     <Hangup/>
 </Response>"""
     
