@@ -70,7 +70,7 @@ function_declarations = [
             "properties": {
                 "customer_name": {
                     "type_": "STRING",
-                    "description": "The customer's full name"
+                    "description": "The customer's name it is required"
                 },
                 "customer_phone": {
                     "type_": "STRING",
