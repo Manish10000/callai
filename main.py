@@ -21,6 +21,9 @@ from product_search import search_products, find_similar_products, find_compleme
 # Import filler sentences
 from filler_sentences import PROCESSING_PHRASES, COMPLETION_PHRASES
 
+# Import language translations
+from language import LANG
+
 # ---------------- Load environment variables ----------------
 load_dotenv()
 
@@ -125,7 +128,7 @@ except Exception as e:
     print("DEBUG: Will use fallback data only")
 
 # ---------------- Greeting ----------------
-WELCOME_GREETING = "नमस्ते! Welcome to GroceryBabu! I'm Aditi, your personal shopping assistant. You can ask me about products, add items to your cart, or place an order."
+# Welcome greeting will be dynamically generated based on detected language
 
 # Language mapping with appropriate voices
 LANGUAGE_MAP = {
@@ -135,47 +138,44 @@ LANGUAGE_MAP = {
     "default": {"code": "en-IN", "voice": "Polly.Aditi"}
 }
 
-# ---------------- Gemini API ----------------
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
-if not GOOGLE_API_KEY:
-    raise ValueError("GOOGLE_API_KEY environment variable not set.")
-
-genai.configure(api_key=GOOGLE_API_KEY)
-
 # Store active chat sessions and context
 sessions = {}
 conversation_context = {}
 call_retry_counts = {}
 
-# Enhanced system prompt with better speech recognition error handling
-# Updated SYSTEM_PROMPT
+# Enhanced system prompt with multilingual support
 SYSTEM_PROMPT = """You are Aditi, a multilingual grocery assistant at GroceryBabu.
 
-LANGUAGE HANDLING RULES:
-1. Detect user's language from input:
-   - English words/patterns → respond in English (en)
-   - Hindi words (मुझे, चाहिए, खरीदना, etc.) → respond in Hindi (hi)
-   - Gujarati words (તમે, છો, છે, etc.) → respond in Gujarati (gu)
-   - Use language code format: <language>[en/hi/gu]</language>
+LANGUAGE DETECTION RULES:
+1. Detect user's language from input patterns:
+   - English words/phrases → respond in English (en)
+   - Hindi words (मुझे, चाहिए, खरीदना, है, हूं, etc.) → respond in Hindi (hi)
+   - Gujarati words written in Hindi script (छे, छूं, तमे, तमारु, etc.) → respond in Gujarati (gu)
+   
+2. CRITICAL: ALL function calls MUST include the language parameter matching detected language.
 
-2. ALL function calls MUST include the language parameter matching the detected language.
+3. Response format: <language>[code]</language><response>[message]</response>
 
-3. Response format:
-   <language>[code]</language><response>[message]</response>
+4. Language consistency rules:
+   - If input is English → ALL outputs (AI + functions) must be English
+   - If input is Hindi → ALL outputs must be Hindi
+   - If input is Gujarati → ALL outputs in Hindi letters but Gujarati words
 
-4. Examples:
-   User: "I want to buy milk" → <language>en</language><response>What type of milk would you like?</response>
+5. Examples:
+   User: "I want milk" → <language>en</language><response>What type of milk would you like?</response>
    User: "मुझे दूध चाहिए" → <language>hi</language><response>आपको किस प्रकार का दूध चाहिए?</response>
-   User: "મને દૂધ જોઈએ છે" → <language>gu</language><response>તમને કેવા પ્રકારનું દૂધ જોઈએ છે?</response>
+   User: "मने दूध जोइए छे" → <language>gu</language><response>तमने केवु दूध जोइए छे?</response>
 
-FUNCTION CALLING:
-- Always pass the detected language to every function call
-- Never assume language, always detect from user input
-- Maintain language consistency throughout conversation
+FUNCTION CALLING REQUIREMENTS:
+- ALWAYS pass detected language to every function call
+- Functions will return responses in the specified language
+- Never mix languages in a single conversation turn
+- Maintain language consistency throughout entire conversation
 
 SPEECH RECOGNITION HANDLING:
 - Handle common misrecognitions gracefully
-- Maintain language context even with recognition errors"""
+- Maintain language context even with recognition errors
+- Use context clues to determine intent when speech is unclear"""
 
 def parse_language_response(response_text):
     """Parse language-tagged response format"""
@@ -240,24 +240,24 @@ def with_processing_feedback(func):
 
 # Apply the decorator to functions that might have processing delays
 @with_processing_feedback
-def add_to_cart_wrapper(call_sid, product_name, quantity, customer_phone=None):
+def add_to_cart_wrapper(call_sid, product_name, quantity, customer_phone=None, language="en"):
     """Wrapper for add_to_cart with processing feedback"""
-    return add_to_cart(call_sid, product_name, quantity, customer_phone)
+    return add_to_cart(call_sid, product_name, quantity, customer_phone, language)
 
 @with_processing_feedback
-def remove_from_cart_wrapper(call_sid, product_name, quantity=None):
+def remove_from_cart_wrapper(call_sid, product_name, quantity=None, language="en"):
     """Wrapper for remove_from_cart with processing feedback"""
-    return remove_from_cart(call_sid, product_name, quantity)
+    return remove_from_cart(call_sid, product_name, quantity, language)
 
 @with_processing_feedback
-def get_cart_summary_wrapper(call_sid):
+def get_cart_summary_wrapper(call_sid, language="en"):
     """Wrapper for get_cart_summary with processing feedback"""
-    return get_cart_summary(call_sid)
+    return get_cart_summary(call_sid, language)
 
 @with_processing_feedback
-def place_order_wrapper(call_sid, customer_data):
+def place_order_wrapper(call_sid, customer_data, language="en"):
     """Wrapper for place_order with processing feedback"""
-    return place_order(call_sid, customer_data)
+    return place_order(call_sid, customer_data, language)
 
 def initialize_session(call_sid):
     """Initialize a new chat session with the system prompt"""
@@ -325,52 +325,36 @@ Interpret the user's intent considering possible speech recognition errors."""
             
             if function_name == "search_products":
                 query = args.get("query", "")
+                language = args.get("language", "en")
                 results = search_products(query)
                 
                 if isinstance(results, dict):
                     if not results:
-                        response_text = "I don't have any items in stock right now."
+                        response_text = LANG["no_products"][language].format(query=query)
                     else:
-                        response_text = "Available categories: "
-                        for category, items in list(results.items())[:3]:
-                            response_text += f"{category} ({len(items)} items), "
-                        response_text += "Which category interests you?"
+                        items_list = ", ".join([f"{cat} ({len(items)} items)" for cat, items in list(results.items())[:3]])
+                        response_text = LANG["product_found"][language].format(count=len(results), items=items_list)
                 
                 elif isinstance(results, list):
                     if results:
                         if len(results) == 1:
                             item = results[0]
-                            response_text = f"I found {item['Item Name']} for ${item['Price (USD)']}. How many would you like?"
-                        elif len(results) > 5:
-                            response_text = f"Found {len(results)} products. Popular ones: "
-                            for i, item in enumerate(results[:3], 1):
-                                response_text += f" {item['Item Name']}, "
-                            response_text += "Which one would you like?"
+                            response_text = LANG["ask_quantity"][language].format(item=item['Item Name'])
                         else:
-                            response_text = "Found these products: "
-                            for i, item in enumerate(results[:3], 1):
-                                response_text += f"{i}. {item['Item Name']} (${item['Price (USD)']}), "
-                            response_text += "Which one would you like?"
+                            items_list = ", ".join([f"{item['Item Name']} (${item['Price (USD)']})" for item in results[:3]])
+                            response_text = LANG["product_found"][language].format(count=len(results), items=items_list)
                     else:
                         similar = find_similar_products(query)
                         if similar:
-                            response_text = f"No '{query}' found. Similar items: "
-                            for item in similar[:2]:
-                                response_text += f"{item['Item Name']} (${item['Price (USD)']}), "
-                            response_text += "Which one interests you?"
+                            items_list = ", ".join([f"{item['Item Name']} (${item['Price (USD)']})" for item in similar[:2]])
+                            response_text = LANG["product_found"][language].format(count=len(similar), items=items_list)
                         else:
-                            categories = get_categories_summary()
-                            if categories:
-                                response_text = f"No '{query}' found. Categories: "
-                                for cat, count in list(categories.items())[:3]:
-                                    response_text += f"{cat} ({count} items), "
-                                response_text += "Which category?"
-                            else:
-                                response_text = f"No products matching '{query}' found."
+                            response_text = LANG["no_products"][language].format(query=query)
             
             elif function_name == "add_to_cart":
                 product_name = args.get("product_name", "")
                 quantity = args.get("quantity", 1)
+                language = args.get("language", "en")
                 
                 customer_phone = None
                 if call_sid in customer_info and "phone" in customer_info[call_sid]:
@@ -378,29 +362,51 @@ Interpret the user's intent considering possible speech recognition errors."""
                 elif call_sid in shopping_carts and "customer_phone" in shopping_carts[call_sid]:
                     customer_phone = shopping_carts[call_sid]["customer_phone"]
                 
-                success, response_text = add_to_cart_wrapper(call_sid, product_name, quantity, customer_phone)
+                success, message = add_to_cart_wrapper(call_sid, product_name, quantity, customer_phone, language)
                 
-                if success and call_sid in shopping_carts and len(shopping_carts[call_sid]["items"]) <= 2:
-                    complementary = find_complementary_products(product_name, max_results=3)
-                    cart_items = [item["name"] for item in shopping_carts[call_sid]["items"]]
-                    available_suggestions = [item for item in complementary if item['Item Name'] not in cart_items]
+                if success:
+                    response_text = LANG["item_added"][language].format(qty=quantity, item=product_name)
                     
-                    if available_suggestions:
-                        item = available_suggestions[0]
-                        response_text += f" Would you also like {item['Item Name']} for ${item['Price (USD)']}?"
+                    if call_sid in shopping_carts and len(shopping_carts[call_sid]["items"]) <= 2:
+                        complementary = find_complementary_products(product_name, max_results=3)
+                        cart_items = [item["name"] for item in shopping_carts[call_sid]["items"]]
+                        available_suggestions = [item for item in complementary if item['Item Name'] not in cart_items]
+                        
+                        if available_suggestions:
+                            item = available_suggestions[0]
+                            response_text += f" {LANG['ask_quantity'][language].format(item=item['Item Name'])}"
+                else:
+                    response_text = message
             
             elif function_name == "remove_from_cart":
                 product_name = args.get("product_name", "")
-                success, response_text = remove_from_cart_wrapper(call_sid, product_name)
+                quantity = args.get("quantity", 1)
+                language = args.get("language", "en")
+                
+                success, message = remove_from_cart_wrapper(call_sid, product_name, quantity, language)
+                
+                if success:
+                    response_text = LANG["item_removed"][language].format(qty=quantity, item=product_name)
+                else:
+                    response_text = message
             
             elif function_name == "get_cart_summary":
-                response_text = get_cart_summary_wrapper(call_sid)
+                language = args.get("language", "en")
+                
+                if call_sid in shopping_carts and shopping_carts[call_sid]["items"]:
+                    cart = shopping_carts[call_sid]
+                    item_count = len(cart["items"])
+                    total = cart["total"]
+                    response_text = LANG["cart_summary"][language].format(count=item_count, total=total)
+                else:
+                    response_text = LANG["cart_empty"][language]
             
             elif function_name == "place_order":
                 # Extract customer info from args or conversation context
                 name = args.get("customer_name", "")
                 phone = args.get("customer_phone", "")
                 address = args.get("customer_address", "")
+                language = args.get("language", "en")
                 
                 # If info is missing from function call, check conversation context
                 if (not name or name.lower() == "unknown") and call_sid in customer_info and "name" in customer_info[call_sid]:
@@ -434,9 +440,16 @@ Interpret the user's intent considering possible speech recognition errors."""
                         "zip": address_parts[3].strip() if len(address_parts) > 3 else ""
                     }
                     
-                    success, response_text = place_order_wrapper(call_sid, customer_data)
+                    success, order_result = place_order_wrapper(call_sid, customer_data, language)
+                    
+                    if success:
+                        # Extract order ID from result if available
+                        order_id = "12345"  # Placeholder
+                        response_text = LANG["order_placed"][language].format(order_id=order_id)
+                    else:
+                        response_text = order_result
                 else:
-                    response_text = "Your cart is empty. Add items before ordering."
+                    response_text = LANG["cart_empty"][language]
             
             else:
                 response_text = "I'm not sure how to handle that request."
@@ -455,22 +468,33 @@ Interpret the user's intent considering possible speech recognition errors."""
         # Enhanced error handling for speech recognition issues
         user_input_lower = user_prompt.lower()
         
-        # Handle common speech recognition errors
+        # Handle common speech recognition errors with multilingual support
+        # Default to English for error handling, but could be enhanced with language detection
+        language = "en"
+        
         if "play store" in user_input_lower or "playstore" in user_input_lower:
             # This usually means "place order" or "products"
             if "app" in user_input_lower or "application" in user_input_lower:
-                response_text = "I understand you want to place an order. Let me check your cart first."
                 if call_sid in shopping_carts and shopping_carts[call_sid]["items"]:
-                    cart_summary = get_cart_summary_wrapper(call_sid)
-                    response_text = f"{response_text} {cart_summary} Would you like to proceed with the order?"
+                    cart = shopping_carts[call_sid]
+                    item_count = len(cart["items"])
+                    total = cart["total"]
+                    cart_summary = LANG["cart_summary"][language].format(count=item_count, total=total)
+                    response_text = f"I understand you want to place an order. {cart_summary} Would you like to proceed?"
                 else:
-                    response_text = "Your cart is empty. Would you like to browse some products first?"
+                    response_text = LANG["cart_empty"][language]
             else:
                 response_text = "I found these products for you. What would you like to add to your cart?"
         
         elif "card" in user_input_lower and "check" in user_input_lower:
             # "check my card" → "check my cart"
-            response_text = get_cart_summary_wrapper(call_sid)
+            if call_sid in shopping_carts and shopping_carts[call_sid]["items"]:
+                cart = shopping_carts[call_sid]
+                item_count = len(cart["items"])
+                total = cart["total"]
+                response_text = LANG["cart_summary"][language].format(count=item_count, total=total)
+            else:
+                response_text = LANG["cart_empty"][language]
         
         elif any(word in user_input_lower for word in ["order", "place order", "checkout"]):
             # Order placement with error recovery
@@ -494,9 +518,14 @@ Interpret the user's intent considering possible speech recognition errors."""
                     customer_info[call_sid]["address"] = "Default Address"
                 
                 # Place the order
-                success, response_text = place_order_wrapper(call_sid, customer_info[call_sid])
+                success, order_result = place_order_wrapper(call_sid, customer_info[call_sid], language)
+                if success:
+                    order_id = "12345"  # Placeholder
+                    response_text = LANG["order_placed"][language].format(order_id=order_id)
+                else:
+                    response_text = order_result
             else:
-                response_text = "Your cart is empty. Add items before ordering."
+                response_text = LANG["cart_empty"][language]
         
         else:
             # Generic error response
@@ -513,7 +542,8 @@ call_retry_counts = {}
 
 @app.post("/twiml")
 async def twiml_endpoint():
-    safe_greeting = "Namaste! Welcome to GroceryBabu! I am Aditi, your personal shopping assistant."
+    # Use English welcome message as default for initial greeting
+    safe_greeting = LANG["welcome"]["en"]
     
     xml_response = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
