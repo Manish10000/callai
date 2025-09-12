@@ -4,13 +4,17 @@ import re
 import gspread
 import uvicorn
 import google.generativeai as genai
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, BackgroundTasks
 from fastapi.responses import Response
 from dotenv import load_dotenv
 from google.oauth2.service_account import Credentials
 from datetime import datetime
 import time
 import random
+import threading
+import queue
+import asyncio
+from typing import Dict
 
 # Import modules
 from functions import function_declarations
@@ -28,6 +32,56 @@ PORT = int(os.getenv("PORT", "8080"))
 DOMAIN = os.getenv("NGROK_URL")
 if not DOMAIN:
     raise ValueError("NGROK_URL environment variable not set.")
+
+# ---------------- Processing Feedback System ----------------
+# Thread-safe queues for processing feedback
+processing_queues: Dict[str, queue.Queue] = {}
+processing_threads: Dict[str, threading.Thread] = {}
+processing_results: Dict[str, Dict] = {}
+
+def processing_worker(call_sid: str, user_input: str):
+    """Background worker to process user request and provide feedback"""
+    try:
+        # Get the queue for this call
+        if call_sid not in processing_queues:
+            processing_queues[call_sid] = queue.Queue()
+        
+        q = processing_queues[call_sid]
+        
+        # Send processing message
+        processing_phrase = random.choice(PROCESSING_PHRASES)
+        q.put({"type": "processing", "message": processing_phrase})
+        
+        # Simulate processing time (or use actual processing time)
+        time.sleep(0.5)
+        
+        # Process the actual request
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        
+        try:
+            detected_language, clean_response = loop.run_until_complete(
+                process_user_query(user_input, call_sid)
+            )
+            
+            # Send completion message
+            completion_phrase = random.choice(COMPLETION_PHRASES)
+            q.put({"type": "completion", "message": f"{completion_phrase} {clean_response}"})
+            
+            # Store the final result
+            processing_results[call_sid] = {
+                "language": detected_language,
+                "response": clean_response,
+                "ready": True
+            }
+            
+        finally:
+            loop.close()
+            
+    except Exception as e:
+        print(f"Error in processing worker for {call_sid}: {e}")
+        if call_sid in processing_queues:
+            processing_queues[call_sid].put({"type": "error", "message": "Sorry, I encountered an error processing your request."})
 
 # ---------------- Google Sheets Setup ----------------
 print("DEBUG: Setting up Google Sheets connection...")
@@ -213,74 +267,6 @@ def parse_language_response(response_text):
     
     return "en", response_text
 
-def with_processing_feedback(func):
-    """
-    Decorator to add processing feedback for functions that might take time
-    """
-    def wrapper(*args, **kwargs):
-        # Extract call_sid from args or kwargs
-        call_sid = None
-        if args and len(args) > 0:
-            call_sid = args[0]
-        elif 'call_sid' in kwargs:
-            call_sid = kwargs['call_sid']
-        
-        # Start timer
-        start_time = time.time()
-        
-        # Execute the function
-        result = func(*args, **kwargs)
-        
-        # Check if processing took more than 1 second
-        processing_time = time.time() - start_time
-        if processing_time > 1 and call_sid:
-            # Select a random processing phrase
-            processing_phrase = random.choice(PROCESSING_PHRASES)
-            completion_phrase = random.choice(COMPLETION_PHRASES)
-            
-            # Add to conversation history
-            add_to_conversation_history(call_sid, "assistant", processing_phrase)
-            
-            # For a real implementation, you would send this to the user
-            # For now, we'll just print it
-            print(f"PROCESSING FEEDBACK: {processing_phrase}")
-            
-            # Wait a moment to simulate the assistant "processing"
-            time.sleep(0.5)
-            
-            # Modify the return message to include the completion phrase
-            if isinstance(result, tuple) and len(result) == 2:
-                success, message = result
-                new_message = f"{completion_phrase} {message.lower()}"
-                return success, new_message
-            elif isinstance(result, str):
-                return f"{completion_phrase} {result.lower()}"
-        
-        return result
-    
-    return wrapper
-
-# Apply the decorator to functions that might have processing delays
-@with_processing_feedback
-def add_to_cart_wrapper(call_sid, product_name, quantity, customer_phone=None):
-    """Wrapper for add_to_cart with processing feedback"""
-    return add_to_cart(call_sid, product_name, quantity, customer_phone)
-
-@with_processing_feedback
-def remove_from_cart_wrapper(call_sid, product_name, quantity=None):
-    """Wrapper for remove_from_cart with processing feedback"""
-    return remove_from_cart(call_sid, product_name, quantity)
-
-@with_processing_feedback
-def get_cart_summary_wrapper(call_sid):
-    """Wrapper for get_cart_summary with processing feedback"""
-    return get_cart_summary(call_sid)
-
-@with_processing_feedback
-def place_order_wrapper(call_sid, customer_data):
-    """Wrapper for place_order with processing feedback"""
-    return place_order(call_sid, customer_data)
-
 def initialize_session(call_sid):
     """Initialize a new chat session with the system prompt"""
     model = genai.GenerativeModel(
@@ -400,7 +386,7 @@ Interpret the user's intent considering possible speech recognition errors."""
                 elif call_sid in shopping_carts and "customer_phone" in shopping_carts[call_sid]:
                     customer_phone = shopping_carts[call_sid]["customer_phone"]
                 
-                success, response_text = add_to_cart_wrapper(call_sid, product_name, quantity, customer_phone)
+                success, response_text = add_to_cart(call_sid, product_name, quantity, customer_phone)
                 
                 if success and call_sid in shopping_carts and len(shopping_carts[call_sid]["items"]) <= 2:
                     complementary = find_complementary_products(product_name, max_results=3)
@@ -413,10 +399,10 @@ Interpret the user's intent considering possible speech recognition errors."""
             
             elif function_name == "remove_from_cart":
                 product_name = args.get("product_name", "")
-                success, response_text = remove_from_cart_wrapper(call_sid, product_name)
+                success, response_text = remove_from_cart(call_sid, product_name)
             
             elif function_name == "get_cart_summary":
-                response_text = get_cart_summary_wrapper(call_sid)
+                response_text = get_cart_summary(call_sid)
             
             elif function_name == "place_order":
                 # Extract customer info from args or conversation context
@@ -456,7 +442,7 @@ Interpret the user's intent considering possible speech recognition errors."""
                         "zip": address_parts[3].strip() if len(address_parts) > 3 else ""
                     }
                     
-                    success, response_text = place_order_wrapper(call_sid, customer_data)
+                    success, response_text = place_order(call_sid, customer_data)
                 else:
                     response_text = "Your cart is empty. Add items before ordering."
             
@@ -483,7 +469,7 @@ Interpret the user's intent considering possible speech recognition errors."""
             if "app" in user_input_lower or "application" in user_input_lower:
                 response_text = "I understand you want to place an order. Let me check your cart first."
                 if call_sid in shopping_carts and shopping_carts[call_sid]["items"]:
-                    cart_summary = get_cart_summary_wrapper(call_sid)
+                    cart_summary = get_cart_summary(call_sid)
                     response_text = f"{response_text} {cart_summary} Would you like to proceed with the order?"
                 else:
                     response_text = "Your cart is empty. Would you like to browse some products first?"
@@ -492,7 +478,7 @@ Interpret the user's intent considering possible speech recognition errors."""
         
         elif "card" in user_input_lower and "check" in user_input_lower:
             # "check my card" → "check my cart"
-            response_text = get_cart_summary_wrapper(call_sid)
+            response_text = get_cart_summary(call_sid)
         
         elif any(word in user_input_lower for word in ["order", "place order", "checkout"]):
             # Order placement with error recovery
@@ -516,7 +502,7 @@ Interpret the user's intent considering possible speech recognition errors."""
                     customer_info[call_sid]["address"] = "Default Address"
                 
                 # Place the order
-                success, response_text = place_order_wrapper(call_sid, customer_info[call_sid])
+                success, response_text = place_order(call_sid, customer_info[call_sid])
             else:
                 response_text = "Your cart is empty. Add items before ordering."
         
@@ -560,93 +546,105 @@ async def handle_speech(request: Request):
     
     print(f"Received speech from {call_sid}: {speech_result}")
     
-    unclear_speech_indicators = ["", "um", "uh", "hmm"]
-    is_unclear = (not speech_result or 
-                  speech_result.strip() == "" or 
-                  (speech_result.strip().lower() in unclear_speech_indicators and len(speech_result.strip()) <= 3))
-    
-    if is_unclear:
-        if call_sid not in call_retry_counts:
-            call_retry_counts[call_sid] = 0
+    # Start processing in background thread
+    if call_sid not in processing_threads or not processing_threads[call_sid].is_alive():
+        # Clear any previous results
+        if call_sid in processing_results:
+            del processing_results[call_sid]
         
-        call_retry_counts[call_sid] += 1
+        # Start new processing thread
+        thread = threading.Thread(
+            target=processing_worker,
+            args=(call_sid, speech_result),
+            daemon=True
+        )
+        processing_threads[call_sid] = thread
+        thread.start()
         
-        if call_retry_counts[call_sid] <= 3:
-            retry_messages = {
-                1: "I did not hear you clearly. Please speak again.",
-                2: "I am still having trouble hearing you. Please try once more.",
-                3: "Let me try one more time. Please speak clearly."
-            }
-            
-            retry_message = retry_messages[call_retry_counts[call_sid]]
-            
-            xml_response = f"""<?xml version="1.0" encoding="UTF-8"?>
+        # Return immediate processing feedback
+        processing_phrase = random.choice(PROCESSING_PHRASES)
+        
+        xml_response = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-    <Say voice="Polly.Aditi">{retry_message}</Say>
-    <Gather input="speech" language="en-IN" action="https://{DOMAIN}/handle-speech" speechTimeout="auto" enhanced="true">
-        <Say voice="Polly.Aditi">Please tell me how I can help you.</Say>
-    </Gather>
-    <Say voice="Polly.Aditi">I still cannot hear you clearly.</Say>
-    <Gather input="speech" language="en-IN" action="https://{DOMAIN}/handle-speech" speechTimeout="auto" enhanced="true">
-        <Say voice="Polly.Aditi">Please speak clearly.</Say>
-    </Gather>
-    <Say voice="Polly.Aditi">I am sorry, I am having trouble hearing you. Please try calling again later.</Say>
-    <Hangup/>
+    <Say voice="Polly.Aditi">{processing_phrase}</Say>
+    <Pause length="2"/>
+    <Redirect>https://{DOMAIN}/check-status/{call_sid}</Redirect>
 </Response>"""
-            return Response(content=xml_response, media_type="text/xml")
-        else:
+        
+        return Response(content=xml_response, media_type="text/xml")
+    
+    else:
+        # Already processing, check status
+        return Response(content=generate_status_check_response(call_sid), media_type="text/xml")
+
+@app.post("/check-status/{call_sid}")
+async def check_status(call_sid: str):
+    """Check processing status and return appropriate response"""
+    if call_sid in processing_results and processing_results[call_sid]["ready"]:
+        # Processing complete, return final response
+        result = processing_results[call_sid]
+        detected_language = result["language"]
+        clean_response = result["response"]
+        
+        language_info = LANGUAGE_MAP.get(detected_language, LANGUAGE_MAP["default"])
+        voice = language_info["voice"]
+        
+        # Clean up
+        if call_sid in processing_results:
+            del processing_results[call_sid]
+        if call_sid in processing_queues:
+            del processing_queues[call_sid]
+        
+        if any(word in clean_response.lower() for word in ["goodbye", "thank you", "end call", "have a great day"]):
             xml_response = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-    <Say voice="Polly.Aditi">I am sorry, I am having trouble hearing you. Please try calling again later.</Say>
+    <Say voice="{voice}">{clean_response}</Say>
     <Hangup/>
 </Response>"""
             if call_sid in call_retry_counts:
                 del call_retry_counts[call_sid]
-            return Response(content=xml_response, media_type="text/xml")
-    
-    if call_sid in call_retry_counts:
-        del call_retry_counts[call_sid]
-    
-    detected_language, clean_response = await process_user_query(speech_result, call_sid)
-    
-    language_info = LANGUAGE_MAP.get(detected_language, LANGUAGE_MAP["default"])
-    detected_language_code = language_info["code"]
-    voice = language_info["voice"]
-    
-    print(f"Language: {detected_language} -> {detected_language_code}, Voice: {voice}")
-    
-    if any(word in clean_response.lower() for word in ["goodbye", "thank you", "end call", "have a great day"]):
-        xml_response = f"""<?xml version="1.0" encoding="UTF-8"?>
+            if call_sid in conversation_context:
+                del conversation_context[call_sid]
+        else:
+            simple_prompts = {
+                "hi": "मैं सुन रहा हूँ।",
+                "gu": "हुं सांभळूं छूं।",
+                "en": "I am listening."
+            }
+            continue_prompt = simple_prompts.get(detected_language, "")
+            
+            xml_response = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
     <Say voice="{voice}">{clean_response}</Say>
-    <Hangup/>
-</Response>"""
-        if call_sid in call_retry_counts:
-            del call_retry_counts[call_sid]
-        if call_sid in conversation_context:
-            del conversation_context[call_sid]
-    else:
-        simple_prompts = {
-            "hi": "मैं सुन रहा हूँ।",
-            "gu": "हुं सांभळूं छूं।",
-            "en": "I am listening."
-        }
-        continue_prompt = simple_prompts.get(detected_language, "")
-        
-        xml_response = f"""<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-    <Say voice="{voice}">{clean_response}</Say>
-    <Gather input="speech" language="{detected_language_code}" action="https://{DOMAIN}/handle-speech" speechTimeout="auto" enhanced="true">
+    <Gather input="speech" language="{language_info['code']}" action="https://{DOMAIN}/handle-speech" speechTimeout="auto" enhanced="true">
     </Gather>
     <Say voice="{voice}">I did not hear you.</Say>
-    <Gather input="speech" language="{detected_language_code}" action="https://{DOMAIN}/handle-speech" speechTimeout="auto" enhanced="true">
+    <Gather input="speech" language="{language_info['code']}" action="https://{DOMAIN}/handle-speech" speechTimeout="auto" enhanced="true">
         <Say voice="{voice}">Please tell me what you need.</Say>
     </Gather>
     <Say voice="{voice}">I am having trouble hearing you. Please try calling again later.</Say>
     <Hangup/>
 </Response>"""
+        
+        return Response(content=xml_response, media_type="text/xml")
     
-    return Response(content=xml_response, media_type="text/xml")
+    else:
+        # Still processing, check again
+        xml_response = f"""<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Pause length="2"/>
+    <Redirect>https://{DOMAIN}/check-status/{call_sid}</Redirect>
+</Response>"""
+        
+        return Response(content=xml_response, media_type="text/xml")
+
+def generate_status_check_response(call_sid):
+    """Generate XML response for status checking"""
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Pause length="2"/>
+    <Redirect>https://{DOMAIN}/check-status/{call_sid}</Redirect>
+</Response>"""
 
 @app.get("/")
 async def root():
@@ -656,7 +654,7 @@ if __name__ == "__main__":
     print(f"Starting server on port {PORT}")
     print(f"Main endpoint: {DOMAIN}/twiml")
     print(f"Speech handler: {DOMAIN}/handle-speech")
-    print("GroceryBabu assistant Aditi is ready with optimized prompts!")
+    print("GroceryBabu assistant Aditi is ready with processing feedback!")
     
     inventory = get_inventory()
     print(f"Found {len(inventory)} items in inventory")
