@@ -1,87 +1,114 @@
-# ---------------- Function Declarations for Gemini ----------------
+# functions.py
 function_declarations = [
     {
         "name": "search_products",
-        "description": "Search for products in the inventory. Use this when user asks about available products, grocery items, snacks, spices, food items, what do you have, show me products, or any product search query. For category requests like 'grocery items' or 'snacks', it will return top 5 items from that category.",
+        "description": "Search for products in the inventory.",
         "parameters": {
             "type": "OBJECT",
             "properties": {
                 "query": {
                     "type": "STRING",
-                    "description": "The search query - can be product name, category (like 'grocery items', 'snacks', 'spices'), or general queries like 'what do you have', 'available items'"
+                    "description": "The search query"
                 },
                 "category": {
                     "type": "STRING",
-                    "description": "Optional specific category filter"
+                    "description": "Optional category filter"
+                },
+                "language": {
+                    "type": "STRING",
+                    "description": "Language code: en, hi, or gu",
+                    "enum": ["en", "hi", "gu"]
                 }
             },
-            "required": ["query"]
+            "required": ["query", "language"]
         }
     },
     {
         "name": "add_to_cart",
-        "description": "Add a product to the shopping cart with specified quantity. ONLY use this when user provides BOTH product name AND quantity. If quantity is missing, ask the user for quantity instead of calling this function.",
+        "description": "Add a product to the shopping cart",
         "parameters": {
             "type": "OBJECT",
             "properties": {
                 "product_name": {
                     "type": "STRING",
-                    "description": "The exact name of the product to add to cart"
+                    "description": "The exact product name"
                 },
                 "quantity": {
                     "type": "INTEGER",
-                    "description": "The quantity of the product to add - REQUIRED, do not assume or default to 1"
+                    "description": "The quantity to add"
+                },
+                "language": {
+                    "type": "STRING",
+                    "description": "Language code: en, hi, or gu",
+                    "enum": ["en", "hi", "gu"]
                 }
             },
-            "required": ["product_name", "quantity"]
+            "required": ["product_name", "quantity", "language"]
         }
     },
     {
         "name": "get_cart_summary",
-        "description": "Get a summary of the current shopping cart contents",
+        "description": "Get shopping cart summary",
         "parameters": {
             "type": "OBJECT",
-            "properties": {}
+            "properties": {
+                "language": {
+                    "type": "STRING",
+                    "description": "Language code: en, hi, or gu",
+                    "enum": ["en", "hi", "gu"]
+                }
+            },
+            "required": ["language"]
         }
     },
     {
         "name": "remove_from_cart",
-        "description": "Remove a product from the shopping cart. Use when user wants to remove, delete, or take out items from cart",
+        "description": "Remove items from cart",
         "parameters": {
             "type": "OBJECT",
             "properties": {
                 "product_name": {
                     "type": "STRING",
-                    "description": "The name of the product to remove from cart"
+                    "description": "Product name to remove"
                 },
                 "quantity": {
                     "type": "INTEGER",
-                    "description": "Optional quantity to remove. If not specified, removes all of that item"
+                    "description": "Quantity to remove"
+                },
+                "language": {
+                    "type": "STRING",
+                    "description": "Language code: en, hi, or gu",
+                    "enum": ["en", "hi", "gu"]
                 }
             },
-            "required": ["product_name"]
+            "required": ["product_name", "language"]
         }
     },
     {
         "name": "place_order",
-        "description": "Place the order with the current cart contents and customer information",
+        "description": "Place order with customer info",
         "parameters": {
             "type": "OBJECT",
             "properties": {
                 "customer_name": {
                     "type": "STRING",
-                    "description": "The customer's name it is required"
+                    "description": "Customer name"
                 },
                 "customer_phone": {
                     "type": "STRING",
-                    "description": "The customer's phone number"
+                    "description": "Phone number"
                 },
                 "customer_address": {
                     "type": "STRING",
-                    "description": "The customer's full address including street, city, state and zip code"
+                    "description": "Delivery address"
+                },
+                "language": {
+                    "type": "STRING",
+                    "description": "Language code: en, hi, or gu",
+                    "enum": ["en", "hi", "gu"]
                 }
             },
-            "required": ["customer_name", "customer_phone", "customer_address"]
+            "required": ["customer_name", "customer_phone", "customer_address", "language"]
         }
     }
 ]
