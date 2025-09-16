@@ -1,12 +1,13 @@
 from datetime import datetime
 from sheets_handler import save_cart, delete_cart, save_customer
+from language import LANG
 import json
 # Global data stores
 shopping_carts = {}  # {call_sid: {items: [], total: 0, customer_phone: ""}}
 customer_info = {}   # {call_sid: {name: "", phone: "", address: "", city: "", state: "", zip: ""}}
 conversation_history = {}  # {call_sid: [{role: "user"/"assistant", content: ""}]}
 
-def add_to_cart(call_sid, product_name, quantity, customer_phone=None):
+def add_to_cart(call_sid, product_name, quantity, customer_phone=None, language="en"):
     """Add item to shopping cart and update Google Sheets"""
     from sheets_handler import get_inventory, save_cart
     
@@ -95,18 +96,18 @@ def add_to_cart(call_sid, product_name, quantity, customer_phone=None):
             except Exception as e:
                 print(f"ERROR: Failed to save cart to sheets: {e}")
             
-            return True, f"Added {quantity} {matched_item['Item Name']} to your cart."
+            return True, LANG["item_added"][language].format(qty=quantity, item=matched_item['Item Name'])
         else:
             return False, f"Only {available_qty} available. Would you like to add {available_qty} instead?"
     
-    return False, "Product not found."
+    return False, LANG["no_products"][language].format(query=product_name)
 
-def remove_from_cart(call_sid, product_name, quantity=None):
+def remove_from_cart(call_sid, product_name, quantity=None, language="en"):
     """Remove item from shopping cart"""
     from sheets_handler import save_cart
     
     if call_sid not in shopping_carts:
-        return False, "Your cart is empty."
+        return False, LANG["cart_empty"][language]
     
     cart = shopping_carts[call_sid]
     
@@ -130,7 +131,7 @@ def remove_from_cart(call_sid, product_name, quantity=None):
                 except Exception as e:
                     print(f"ERROR: Failed to save cart after removal: {e}")
                 
-                return True, f"Removed {removed_item['name']} from your cart."
+                return True, LANG["item_removed"][language].format(qty=removed_item['quantity'], item=removed_item['name'])
             else:
                 # Reduce quantity
                 cart_item["quantity"] -= quantity
@@ -153,22 +154,20 @@ def remove_from_cart(call_sid, product_name, quantity=None):
     
     return False, f"Could not find {product_name} in your cart."
 
-def get_cart_summary(call_sid):
+def get_cart_summary(call_sid, language="en"):
     """Get summary of shopping cart"""
     if call_sid not in shopping_carts or not shopping_carts[call_sid]["items"]:
-        return "Your cart is empty."
+        return LANG["cart_empty"][language]
     
     cart = shopping_carts[call_sid]
-    summary = "Your cart contains: "
-    for item in cart["items"]:
-        summary += f"{item['quantity']} {item['name']}, "
-    summary += f"Total: ${cart['total']:.2f}"
-    return summary
+    item_count = len(cart["items"])
+    total = cart["total"]
+    return LANG["cart_summary"][language].format(count=item_count, total=total)
 
-def place_order(call_sid, customer_data):
+def place_order(call_sid, customer_data, language="en"):
     """Place order and update Google Sheets"""
     if call_sid not in shopping_carts or not shopping_carts[call_sid]["items"]:
-        return False, "Your cart is empty. Cannot place order."
+        return False, LANG["cart_empty"][language]
     
     try:
         # Update inventory
@@ -211,7 +210,8 @@ def place_order(call_sid, customer_data):
         # Remove cart from Google Sheets
         delete_cart(call_sid)
         
-        return True, f"Order placed successfully! Your total is ${order_total:.2f}. Thank you for shopping with GroceryBabu!"
+        order_id = datetime.now().strftime("%Y%m%d%H%M%S")
+        return True, LANG["order_placed"][language].format(order_id=order_id)
     
     except Exception as e:
         return False, f"Error placing order: {str(e)}"
