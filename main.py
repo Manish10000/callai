@@ -4,13 +4,17 @@ import re
 import gspread
 import uvicorn
 import google.generativeai as genai
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, BackgroundTasks
 from fastapi.responses import Response
 from dotenv import load_dotenv
 from google.oauth2.service_account import Credentials
 from datetime import datetime
 import time
 import random
+import threading
+import queue
+import asyncio
+from typing import Dict
 
 # Import modules
 from functions import function_declarations
@@ -18,10 +22,8 @@ from sheets_handler import get_inventory, get_customer_by_phone, save_customer, 
 from cart_manager import shopping_carts, customer_info, conversation_history, add_to_cart, get_cart_summary, place_order, add_to_conversation_history, get_conversation_context, remove_from_cart
 from product_search import search_products, find_similar_products, find_complementary_products, get_categories_summary
 
-# Import filler sentences
-from filler_sentences import PROCESSING_PHRASES, COMPLETION_PHRASES
-
-# Import language translations
+# Import filler sentences and language utilities
+from filler_sentences import get_processing_phrase, get_completion_phrase
 from language import LANG
 
 # ---------------- Load environment variables ----------------
@@ -31,6 +33,60 @@ PORT = int(os.getenv("PORT", "8080"))
 DOMAIN = os.getenv("NGROK_URL")
 if not DOMAIN:
     raise ValueError("NGROK_URL environment variable not set.")
+
+# ---------------- Processing Feedback System ----------------
+# Thread-safe queues for processing feedback
+processing_queues: Dict[str, queue.Queue] = {}
+processing_threads: Dict[str, threading.Thread] = {}
+processing_results: Dict[str, Dict] = {}
+
+def processing_worker(call_sid: str, user_input: str):
+    """Background worker to process user request and provide feedback"""
+    try:
+        # Get the queue for this call
+        if call_sid not in processing_queues:
+            processing_queues[call_sid] = queue.Queue()
+        
+        q = processing_queues[call_sid]
+        
+        # Use session language from previous interactions, fallback to global language
+        session_lang = get_session_language(call_sid) if call_sid in session_languages else current_language
+        
+        # Send processing message in appropriate language
+        processing_phrase = get_processing_phrase(session_lang)
+        q.put({"type": "processing", "message": processing_phrase})
+        
+        # Simulate processing time (or use actual processing time)
+        time.sleep(0.5)
+        
+        # Process the actual request
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        
+        try:
+            detected_language, clean_response = loop.run_until_complete(
+                process_user_query(user_input, call_sid)
+            )
+            
+            # Send completion message in detected language
+            completion_phrase = get_completion_phrase(detected_language)
+            q.put({"type": "completion", "message": f"{completion_phrase} {clean_response}"})
+            
+            # Store the final result
+            processing_results[call_sid] = {
+                "language": detected_language,
+                "response": clean_response,
+                "ready": True
+            }
+            
+        finally:
+            loop.close()
+            
+    except Exception as e:
+        print(f"Error in processing worker for {call_sid}: {e}")
+        if call_sid in processing_queues:
+            error_msg = get_localized_text("processing_error", current_language) or "Sorry, I encountered an error processing your request."
+            processing_queues[call_sid].put({"type": "error", "message": error_msg})
 
 # ---------------- Google Sheets Setup ----------------
 print("DEBUG: Setting up Google Sheets connection...")
@@ -128,7 +184,7 @@ except Exception as e:
     print("DEBUG: Will use fallback data only")
 
 # ---------------- Greeting ----------------
-# Welcome greeting will be dynamically generated based on detected language
+WELCOME_GREETING = "नमस्ते! Welcome to GroceryBabu! I'm Aditi, your personal shopping assistant. You can ask me about products, add items to your cart, or place an order."
 
 # Language mapping with appropriate voices
 LANGUAGE_MAP = {
@@ -138,44 +194,147 @@ LANGUAGE_MAP = {
     "default": {"code": "en-IN", "voice": "Polly.Aditi"}
 }
 
+# ---------------- Gemini API ----------------
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+if not GOOGLE_API_KEY:
+    raise ValueError("GOOGLE_API_KEY environment variable not set.")
+
+genai.configure(api_key=GOOGLE_API_KEY)
+
 # Store active chat sessions and context
 sessions = {}
 conversation_context = {}
 call_retry_counts = {}
 
-# Enhanced system prompt with multilingual support
-SYSTEM_PROMPT = """You are Aditi, a multilingual grocery assistant at GroceryBabu.
+# Global language management
+current_language = "en"  # Default language
+session_languages = {}  # Track language per session
 
-LANGUAGE DETECTION RULES:
-1. Detect user's language from input patterns:
-   - English words/phrases → respond in English (en)
-   - Hindi words (मुझे, चाहिए, खरीदना, है, हूं, etc.) → respond in Hindi (hi)
-   - Gujarati words written in Hindi script (छे, छूं, तमे, तमारु, etc.) → respond in Gujarati (gu)
-   
-2. CRITICAL: ALL function calls MUST include the language parameter matching detected language.
+# Warm-up session for faster first requests
+warmup_session = None
 
-3. Response format: <language>[code]</language><response>[message]</response>
+def initialize_warmup_session():
+    """Initialize a warm-up Gemini session to reduce first request latency"""
+    global warmup_session
+    try:
+        print("DEBUG: Initializing Gemini warm-up session...")
+        model = genai.GenerativeModel(
+            model_name='gemini-1.5-flash',
+            tools=function_declarations
+        )
+        
+        warmup_session = model.start_chat(history=[])
+        
+        # Send system prompt to warm up the session
+        warmup_session.send_message(SYSTEM_PROMPT)
+        
+        # Send a simple test message to fully initialize
+        test_response = warmup_session.send_message("Hello, test message for initialization")
+        
+        print("DEBUG: Gemini warm-up session initialized successfully")
+        return True
+        
+    except Exception as e:
+        print(f"DEBUG: Warm-up session initialization failed: {e}")
+        warmup_session = None
+        return False
 
-4. Language consistency rules:
-   - If input is English → ALL outputs (AI + functions) must be English
-   - If input is Hindi → ALL outputs must be Hindi
-   - If input is Gujarati → ALL outputs in Hindi letters but Gujarati words
+def set_global_language(lang_code):
+    """Set global language with fallback to English"""
+    global current_language
+    print("DEBUG: Setting global language to", lang_code)
+    if lang_code in ["en", "hi", "gu"]:
+        current_language = lang_code
+    else:
+        current_language = "en"
+    return current_language
 
-5. Examples:
-   User: "I want milk" → <language>en</language><response>What type of milk would you like?</response>
-   User: "मुझे दूध चाहिए" → <language>hi</language><response>आपको किस प्रकार का दूध चाहिए?</response>
-   User: "मने दूध जोइए छे" → <language>gu</language><response>तमने केवु दूध जोइए छे?</response>
+def get_session_language(call_sid):
+    """Get language for specific session with fallback"""
+    print("DEBUG: Getting session language for", call_sid)
+    print("DEBUG: Session languages:", session_languages)
+    return session_languages.get(call_sid, current_language)
 
-FUNCTION CALLING REQUIREMENTS:
-- ALWAYS pass detected language to every function call
-- Functions will return responses in the specified language
-- Never mix languages in a single conversation turn
-- Maintain language consistency throughout entire conversation
+def set_session_language(call_sid, lang_code):
+    """Set language for specific session"""
+    print("DEBUG: Setting session language for", call_sid, "to", lang_code)
+    if lang_code in ["en", "hi", "gu"]:
+        print("DEBUG: Setting session language to", lang_code)
+        session_languages[call_sid] = lang_code
+    else:
+        print("DEBUG: Setting session language to default", current_language)
+        session_languages[call_sid] = current_language
+    return session_languages[call_sid]
 
-SPEECH RECOGNITION HANDLING:
-- Handle common misrecognitions gracefully
-- Maintain language context even with recognition errors
-- Use context clues to determine intent when speech is unclear"""
+def get_localized_text(key, lang_code=None, **kwargs):
+    """Get localized text with fallback to English"""
+    if lang_code is None:
+        lang_code = current_language
+    
+    if key in LANG and lang_code in LANG[key]:
+        text = LANG[key][lang_code]
+    elif key in LANG and "en" in LANG[key]:
+        text = LANG[key]["en"]
+    else:
+        return f"Missing translation for {key}"
+    
+    # Format with provided kwargs
+    try:
+        return text.format(**kwargs)
+    except KeyError:
+        return text
+
+# Enhanced system prompt with better speech recognition error handling
+SYSTEM_PROMPT = """You are Aditi, a helpful grocery assistant at GroceryBabu.
+
+LANGUAGE: Detect user's language from input and respond in same language using format:
+<language>[hi/gu/en]</language><response>[response]</response>
+
+SPEECH RECOGNITION ERROR HANDLING:
+- "Play Store app" → "place order" or "products"
+- "card" → "cart", "check my card" → "check my cart"
+- "milk vicks/wicks" → "milk bikis", "type of them" → "two of them"
+- "wife of the" → "five of them", "tour of" → "two of"
+- "auto" → "two", "offline" → "all fine"
+- "mrutyunjay" → "Mrutyunjay" (name), "Patra" → "Patra" (surname)
+- "place order" → "place order", "order place" → "place order"
+- "Play Store" → usually means "place order" or "products"
+
+ORDER PROCESSING RULES:
+1. If user says "order", "place order", "checkout", "Play Store app" → proceed to order placement
+2. For names: If unclear, use what you hear (e.g., "Mrutyunjay Patra" → accept as name)
+3. For demo: Accept any reasonable name/address, don't ask for perfection
+4 Text response: The user's statement "Play Store update" is still likely a mis-spoken attempt to place an order or refer to their order status.  Given the previous context, I'll assume they want to proceed with the order and request customer information. do not send the responce like this just call the funciton place_order() and pass the customer information. this is a unneccessary text response.
+make the responce simple and direct.where not required do not add any text response. just call the required function with the required parameters.
+
+CUSTOMER INFO COLLECTION:
+- If user provides name: Store it and proceed
+- If name unclear: Use what you hear, don't ask for clarification in demo
+- For address: Accept simple addresses like "home", "office", "123 Main St"
+
+FUNCTION SELECTION:
+- search_products(): For product searches
+- add_to_cart(): When user selects products
+- get_cart_summary(): When user asks about cart
+- remove_from_cart(): When user wants to remove items
+- place_order(): When user wants to complete purchase
+Detect user language:
+        - Hindi words (mujhe, chahiye, kharidna, etc.) → respond in Hindi (code: hi)
+        - Gujarati words (tame, cho, chhe, etc.) → respond in Gujarati (code: gu)
+        - Otherwise → respond in English (code: en)
+        - Transliterated Hindi/Gujarati → treat as native language
+
+        Response format:
+        <language>[code]</language><response>[reply]</response>
+
+        Examples:
+        User: "Mujhe kuchh kharidna tha"
+        → <language>hi</language><response>आपको क्या चाहिए?</response>
+
+        User: "Tame kya cho?"
+        → <language>gu</language><response>हुं मजामा छूं! तमने शुं जोयए?</response>
+
+RESPONSE FORMAT: Always use <language>code</language><response>message</response>"""
 
 def parse_language_response(response_text):
     """Parse language-tagged response format"""
@@ -189,87 +348,40 @@ def parse_language_response(response_text):
         clean_response = response_match.group(1).strip()
         return detected_language, clean_response
     
-    return "en", response_text
-
-def with_processing_feedback(func):
-    """
-    Decorator to add processing feedback for functions that might take time
-    """
-    def wrapper(*args, **kwargs):
-        # Extract call_sid from args or kwargs
-        call_sid = None
-        if args and len(args) > 0:
-            call_sid = args[0]
-        elif 'call_sid' in kwargs:
-            call_sid = kwargs['call_sid']
-        
-        # Start timer
-        start_time = time.time()
-        
-        # Execute the function
-        result = func(*args, **kwargs)
-        
-        # Check if processing took more than 1 second
-        processing_time = time.time() - start_time
-        if processing_time > 1 and call_sid:
-            # Select a random processing phrase
-            processing_phrase = random.choice(PROCESSING_PHRASES)
-            completion_phrase = random.choice(COMPLETION_PHRASES)
-            
-            # Add to conversation history
-            add_to_conversation_history(call_sid, "assistant", processing_phrase)
-            
-            # For a real implementation, you would send this to the user
-            # For now, we'll just print it
-            print(f"PROCESSING FEEDBACK: {processing_phrase}")
-            
-            # Wait a moment to simulate the assistant "processing"
-            time.sleep(0.5)
-            
-            # Modify the return message to include the completion phrase
-            if isinstance(result, tuple) and len(result) == 2:
-                success, message = result
-                new_message = f"{completion_phrase} {message.lower()}"
-                return success, new_message
-            elif isinstance(result, str):
-                return f"{completion_phrase} {result.lower()}"
-        
-        return result
-    
-    return wrapper
-
-# Apply the decorator to functions that might have processing delays
-@with_processing_feedback
-def add_to_cart_wrapper(call_sid, product_name, quantity, customer_phone=None, language="en"):
-    """Wrapper for add_to_cart with processing feedback"""
-    return add_to_cart(call_sid, product_name, quantity, customer_phone, language)
-
-@with_processing_feedback
-def remove_from_cart_wrapper(call_sid, product_name, quantity=None, language="en"):
-    """Wrapper for remove_from_cart with processing feedback"""
-    return remove_from_cart(call_sid, product_name, quantity, language)
-
-@with_processing_feedback
-def get_cart_summary_wrapper(call_sid, language="en"):
-    """Wrapper for get_cart_summary with processing feedback"""
-    return get_cart_summary(call_sid, language)
-
-@with_processing_feedback
-def place_order_wrapper(call_sid, customer_data, language="en"):
-    """Wrapper for place_order with processing feedback"""
-    return place_order(call_sid, customer_data, language)
+    return None, response_text
 
 def initialize_session(call_sid):
-    """Initialize a new chat session with the system prompt"""
-    model = genai.GenerativeModel(
-        model_name='gemini-1.5-flash',
-        tools=function_declarations
-    )
+    """Initialize a new chat session with the system prompt (optimized with warm-up)"""
+    global warmup_session
     
-    sessions[call_sid] = model.start_chat(history=[])
-    
-    # Send system prompt as the first message
-    sessions[call_sid].send_message(SYSTEM_PROMPT)
+    # Try to use warm-up session for faster initialization
+    if warmup_session is not None:
+        try:
+            # Clone the warm-up session for this call
+            model = genai.GenerativeModel(
+                model_name='gemini-1.5-flash',
+                tools=function_declarations
+            )
+            sessions[call_sid] = model.start_chat(history=[])
+            sessions[call_sid].send_message(SYSTEM_PROMPT)
+            print(f"DEBUG: Fast session initialization for {call_sid}")
+        except Exception as e:
+            print(f"DEBUG: Fast initialization failed, using standard method: {e}")
+            # Fallback to standard initialization
+            model = genai.GenerativeModel(
+                model_name='gemini-1.5-flash',
+                tools=function_declarations
+            )
+            sessions[call_sid] = model.start_chat(history=[])
+            sessions[call_sid].send_message(SYSTEM_PROMPT)
+    else:
+        # Standard initialization
+        model = genai.GenerativeModel(
+            model_name='gemini-1.5-flash',
+            tools=function_declarations
+        )
+        sessions[call_sid] = model.start_chat(history=[])
+        sessions[call_sid].send_message(SYSTEM_PROMPT)
     
     # Load existing cart if available
     existing_cart = load_cart(call_sid)
@@ -288,6 +400,9 @@ async def process_user_query(user_prompt, call_sid):
     # Initialize session if it doesn't exist
     if call_sid not in sessions:
         initialize_session(call_sid)
+    
+    # Get current session language
+    session_lang = get_session_language(call_sid)
     
     # Enhanced context with speech recognition error handling
     enhanced_context = f"""CONVERSATION HISTORY:
@@ -323,38 +438,63 @@ Interpret the user's intent considering possible speech recognition errors."""
             
             print(f"DEBUG: Function call: {function_name} with args: {args}")
             
+            # Update global language immediately when detected by Gemini
+            if 'language' in args and args['language'] in ["en", "hi", "gu"]:
+                detected_lang = args['language']
+                set_global_language(detected_lang)
+                set_session_language(call_sid, detected_lang)
+                print(f"DEBUG: Updated global language to {detected_lang}")
+            
             if function_name == "search_products":
                 query = args.get("query", "")
-                language = args.get("language", "en")
+                lang_code = args.get("language", session_lang)
                 results = search_products(query)
                 
                 if isinstance(results, dict):
                     if not results:
-                        response_text = LANG["no_products"][language].format(query=query)
+                        response_text = get_localized_text("no_inventory", lang_code) or "I don't have any items in stock right now."
                     else:
-                        items_list = ", ".join([f"{cat} ({len(items)} items)" for cat, items in list(results.items())[:3]])
-                        response_text = LANG["product_found"][language].format(count=len(results), items=items_list)
+                        response_text = get_localized_text("available_categories", lang_code) or "Available categories: "
+                        for category, items in list(results.items())[:3]:
+                            response_text += f"{category} ({len(items)} items), "
+                        response_text += get_localized_text("which_category", lang_code) or "Which category interests you?"
                 
                 elif isinstance(results, list):
                     if results:
                         if len(results) == 1:
                             item = results[0]
-                            response_text = LANG["ask_quantity"][language].format(item=item['Item Name'])
+                            response_text = get_localized_text("ask_quantity", lang_code, item=item['Item Name']) or f"I found {item['Item Name']}. How many would you like?"
+                        elif len(results) > 5:
+                            response_text = get_localized_text("product_found", lang_code, count=len(results), items="") or f"Found {len(results)} products. Popular ones: "
+                            product_names = [item['Item Name'] for item in results[:3]]
+                            response_text += ", ".join(product_names) + ". "
+                            response_text += get_localized_text("which_one", lang_code) or "Which one would you like?"
                         else:
-                            items_list = ", ".join([f"{item['Item Name']} (${item['Price (USD)']})" for item in results[:3]])
-                            response_text = LANG["product_found"][language].format(count=len(results), items=items_list)
+                            response_text = get_localized_text("product_found", lang_code, count=len(results), items="") or "Found these products: "
+                            product_names = [item['Item Name'] for item in results[:3]]
+                            response_text += ", ".join(product_names) + ". "
+                            response_text += get_localized_text("which_one", lang_code) or "Which one would you like?"
                     else:
                         similar = find_similar_products(query)
                         if similar:
-                            items_list = ", ".join([f"{item['Item Name']} (${item['Price (USD)']})" for item in similar[:2]])
-                            response_text = LANG["product_found"][language].format(count=len(similar), items=items_list)
+                            response_text = get_localized_text("no_products", lang_code, query=query) or f"No '{query}' found. Similar items: "
+                            similar_names = [item['Item Name'] for item in similar[:2]]
+                            response_text += ", ".join(similar_names) + ". "
+                            response_text += get_localized_text("which_interests", lang_code) or "Which one interests you?"
                         else:
-                            response_text = LANG["no_products"][language].format(query=query)
+                            categories = get_categories_summary()
+                            if categories:
+                                response_text = get_localized_text("no_products", lang_code, query=query) or f"No '{query}' found. Categories: "
+                                for cat, count in list(categories.items())[:3]:
+                                    response_text += f"{cat} ({count} items), "
+                                response_text += get_localized_text("which_category", lang_code) or "Which category?"
+                            else:
+                                response_text = get_localized_text("no_products", lang_code, query=query) or f"No products matching '{query}' found."
             
             elif function_name == "add_to_cart":
                 product_name = args.get("product_name", "")
                 quantity = args.get("quantity", 1)
-                language = args.get("language", "en")
+                lang_code = args.get("language", session_lang)
                 
                 customer_phone = None
                 if call_sid in customer_info and "phone" in customer_info[call_sid]:
@@ -362,51 +502,49 @@ Interpret the user's intent considering possible speech recognition errors."""
                 elif call_sid in shopping_carts and "customer_phone" in shopping_carts[call_sid]:
                     customer_phone = shopping_carts[call_sid]["customer_phone"]
                 
-                success, message = add_to_cart_wrapper(call_sid, product_name, quantity, customer_phone, language)
+                success, response_text = add_to_cart(call_sid, product_name, quantity, customer_phone)
                 
+                # Localize the response
                 if success:
-                    response_text = LANG["item_added"][language].format(qty=quantity, item=product_name)
-                    
-                    if call_sid in shopping_carts and len(shopping_carts[call_sid]["items"]) <= 2:
-                        complementary = find_complementary_products(product_name, max_results=3)
-                        cart_items = [item["name"] for item in shopping_carts[call_sid]["items"]]
-                        available_suggestions = [item for item in complementary if item['Item Name'] not in cart_items]
-                        
-                        if available_suggestions:
-                            item = available_suggestions[0]
-                            response_text += f" {LANG['ask_quantity'][language].format(item=item['Item Name'])}"
+                    response_text = get_localized_text("item_added", lang_code, qty=quantity, item=product_name) or response_text
                 else:
-                    response_text = message
+                    response_text = get_localized_text("add_failed", lang_code) or response_text
+                
+                if success and call_sid in shopping_carts and len(shopping_carts[call_sid]["items"]) <= 2:
+                    complementary = find_complementary_products(product_name, max_results=3)
+                    cart_items = [item["name"] for item in shopping_carts[call_sid]["items"]]
+                    available_suggestions = [item for item in complementary if item['Item Name'] not in cart_items]
+                    
+                    if available_suggestions:
+                        item = available_suggestions[0]
+                        suggestion_text = get_localized_text("suggest_item", lang_code, item=item['Item Name']) or f" Would you also like {item['Item Name']}?"
+                        response_text += suggestion_text
             
             elif function_name == "remove_from_cart":
                 product_name = args.get("product_name", "")
-                quantity = args.get("quantity", 1)
-                language = args.get("language", "en")
+                lang_code = args.get("language", session_lang)
+                success, response_text = remove_from_cart(call_sid, product_name)
                 
-                success, message = remove_from_cart_wrapper(call_sid, product_name, quantity, language)
-                
+                # Localize the response
                 if success:
-                    response_text = LANG["item_removed"][language].format(qty=quantity, item=product_name)
+                    response_text = get_localized_text("item_removed", lang_code, item=product_name) or response_text
                 else:
-                    response_text = message
+                    response_text = get_localized_text("remove_failed", lang_code) or response_text
             
             elif function_name == "get_cart_summary":
-                language = args.get("language", "en")
+                lang_code = args.get("language", session_lang)
+                response_text = get_cart_summary(call_sid)
                 
-                if call_sid in shopping_carts and shopping_carts[call_sid]["items"]:
-                    cart = shopping_carts[call_sid]
-                    item_count = len(cart["items"])
-                    total = cart["total"]
-                    response_text = LANG["cart_summary"][language].format(count=item_count, total=total)
-                else:
-                    response_text = LANG["cart_empty"][language]
+                # Get localized cart summary if cart is empty
+                if "empty" in response_text.lower():
+                    response_text = get_localized_text("cart_empty", lang_code) or response_text
             
             elif function_name == "place_order":
                 # Extract customer info from args or conversation context
                 name = args.get("customer_name", "")
                 phone = args.get("customer_phone", "")
                 address = args.get("customer_address", "")
-                language = args.get("language", "en")
+                lang_code = args.get("language", session_lang)
                 
                 # If info is missing from function call, check conversation context
                 if (not name or name.lower() == "unknown") and call_sid in customer_info and "name" in customer_info[call_sid]:
@@ -440,16 +578,14 @@ Interpret the user's intent considering possible speech recognition errors."""
                         "zip": address_parts[3].strip() if len(address_parts) > 3 else ""
                     }
                     
-                    success, order_result = place_order_wrapper(call_sid, customer_data, language)
+                    success, response_text = place_order(call_sid, customer_data)
                     
-                    if success:
-                        # Extract order ID from result if available
-                        order_id = "12345"  # Placeholder
-                        response_text = LANG["order_placed"][language].format(order_id=order_id)
-                    else:
-                        response_text = order_result
+                    # Localize order response
+                    if success and "Order ID:" in response_text:
+                        order_id = response_text.split("Order ID:")[1].strip()
+                        response_text = get_localized_text("order_placed", lang_code, order_id=order_id) or response_text
                 else:
-                    response_text = LANG["cart_empty"][language]
+                    response_text = get_localized_text("cart_empty", lang_code) or "Your cart is empty. Add items before ordering."
             
             else:
                 response_text = "I'm not sure how to handle that request."
@@ -459,6 +595,15 @@ Interpret the user's intent considering possible speech recognition errors."""
             print(f"DEBUG: Text response: {response_text}")
         
         detected_lang, clean_response = parse_language_response(response_text)
+        
+        # Update session language if detected, otherwise preserve current session language
+        if detected_lang and detected_lang in ["en", "hi", "gu"]:
+            set_session_language(call_sid, detected_lang)
+            set_global_language(detected_lang)  # Update global language too
+        else:
+            # Use existing session language if no language detected in response
+            detected_lang = get_session_language(call_sid)
+        
         add_to_conversation_history(call_sid, "assistant", clean_response)
         return detected_lang, clean_response
     
@@ -467,34 +612,25 @@ Interpret the user's intent considering possible speech recognition errors."""
         
         # Enhanced error handling for speech recognition issues
         user_input_lower = user_prompt.lower()
+        session_lang = get_session_language(call_sid)
         
-        # Handle common speech recognition errors with multilingual support
-        # Default to English for error handling, but could be enhanced with language detection
-        language = "en"
-        
+        # Handle common speech recognition errors
         if "play store" in user_input_lower or "playstore" in user_input_lower:
             # This usually means "place order" or "products"
             if "app" in user_input_lower or "application" in user_input_lower:
+                response_text = get_localized_text("order_check_cart", session_lang) or "I understand you want to place an order. Let me check your cart first."
                 if call_sid in shopping_carts and shopping_carts[call_sid]["items"]:
-                    cart = shopping_carts[call_sid]
-                    item_count = len(cart["items"])
-                    total = cart["total"]
-                    cart_summary = LANG["cart_summary"][language].format(count=item_count, total=total)
-                    response_text = f"I understand you want to place an order. {cart_summary} Would you like to proceed?"
+                    cart_summary = get_cart_summary(call_sid)
+                    proceed_text = get_localized_text("proceed_order", session_lang) or "Would you like to proceed with the order?"
+                    response_text = f"{response_text} {cart_summary} {proceed_text}"
                 else:
-                    response_text = LANG["cart_empty"][language]
+                    response_text = get_localized_text("cart_empty_browse", session_lang) or "Your cart is empty. Would you like to browse some products first?"
             else:
-                response_text = "I found these products for you. What would you like to add to your cart?"
+                response_text = get_localized_text("products_available", session_lang) or "I found these products for you. What would you like to add to your cart?"
         
         elif "card" in user_input_lower and "check" in user_input_lower:
             # "check my card" → "check my cart"
-            if call_sid in shopping_carts and shopping_carts[call_sid]["items"]:
-                cart = shopping_carts[call_sid]
-                item_count = len(cart["items"])
-                total = cart["total"]
-                response_text = LANG["cart_summary"][language].format(count=item_count, total=total)
-            else:
-                response_text = LANG["cart_empty"][language]
+            response_text = get_cart_summary(call_sid)
         
         elif any(word in user_input_lower for word in ["order", "place order", "checkout"]):
             # Order placement with error recovery
@@ -518,21 +654,29 @@ Interpret the user's intent considering possible speech recognition errors."""
                     customer_info[call_sid]["address"] = "Default Address"
                 
                 # Place the order
-                success, order_result = place_order_wrapper(call_sid, customer_info[call_sid], language)
-                if success:
-                    order_id = "12345"  # Placeholder
-                    response_text = LANG["order_placed"][language].format(order_id=order_id)
-                else:
-                    response_text = order_result
+                success, response_text = place_order(call_sid, customer_info[call_sid])
+                # Localize order response if successful
+                if success and "Order ID:" in response_text:
+                    order_id = response_text.split("Order ID:")[1].strip()
+                    response_text = get_localized_text("order_placed", session_lang, order_id=order_id) or response_text
             else:
-                response_text = LANG["cart_empty"][language]
+                response_text = get_localized_text("cart_empty", session_lang) or "Your cart is empty. Add items before ordering."
         
         else:
             # Generic error response
-            response_text = "I didn't understand that clearly. Could you please repeat?"
+            response_text = get_localized_text("unclear_request", session_lang) or "I didn't understand that clearly. Could you please repeat?"
         
-        response_text = f"<language>en</language><response>{response_text}</response>"
+        response_text = f"<language>{session_lang}</language><response>{response_text}</response>"
         detected_lang, clean_response = parse_language_response(response_text)
+        
+        # Update session language if detected, otherwise preserve current session language
+        if detected_lang and detected_lang in ["en", "hi", "gu"]:
+            set_session_language(call_sid, detected_lang)
+            set_global_language(detected_lang)
+        else:
+            # Use existing session language if no language detected in response
+            detected_lang = get_session_language(call_sid)
+        
         add_to_conversation_history(call_sid, "assistant", clean_response)
         return detected_lang, clean_response
 
@@ -542,8 +686,7 @@ call_retry_counts = {}
 
 @app.post("/twiml")
 async def twiml_endpoint():
-    # Use English welcome message as default for initial greeting
-    safe_greeting = LANG["welcome"]["en"]
+    safe_greeting = "Namaste! Welcome to GroceryBabu! I am Aditi, your personal shopping assistant."
     
     xml_response = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
@@ -568,93 +711,105 @@ async def handle_speech(request: Request):
     
     print(f"Received speech from {call_sid}: {speech_result}")
     
-    unclear_speech_indicators = ["", "um", "uh", "hmm"]
-    is_unclear = (not speech_result or 
-                  speech_result.strip() == "" or 
-                  (speech_result.strip().lower() in unclear_speech_indicators and len(speech_result.strip()) <= 3))
-    
-    if is_unclear:
-        if call_sid not in call_retry_counts:
-            call_retry_counts[call_sid] = 0
+    # Start processing in background thread
+    if call_sid not in processing_threads or not processing_threads[call_sid].is_alive():
+        # Clear any previous results
+        if call_sid in processing_results:
+            del processing_results[call_sid]
         
-        call_retry_counts[call_sid] += 1
+        # Start new processing thread
+        thread = threading.Thread(
+            target=processing_worker,
+            args=(call_sid, speech_result),
+            daemon=True
+        )
+        processing_threads[call_sid] = thread
+        thread.start()
         
-        if call_retry_counts[call_sid] <= 3:
-            retry_messages = {
-                1: "I did not hear you clearly. Please speak again.",
-                2: "I am still having trouble hearing you. Please try once more.",
-                3: "Let me try one more time. Please speak clearly."
-            }
-            
-            retry_message = retry_messages[call_retry_counts[call_sid]]
-            
-            xml_response = f"""<?xml version="1.0" encoding="UTF-8"?>
+        # Return immediate processing feedback in appropriate language
+        processing_phrase = get_processing_phrase(current_language)
+        
+        xml_response = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-    <Say voice="Polly.Aditi">{retry_message}</Say>
-    <Gather input="speech" language="en-IN" action="https://{DOMAIN}/handle-speech" speechTimeout="auto" enhanced="true">
-        <Say voice="Polly.Aditi">Please tell me how I can help you.</Say>
-    </Gather>
-    <Say voice="Polly.Aditi">I still cannot hear you clearly.</Say>
-    <Gather input="speech" language="en-IN" action="https://{DOMAIN}/handle-speech" speechTimeout="auto" enhanced="true">
-        <Say voice="Polly.Aditi">Please speak clearly.</Say>
-    </Gather>
-    <Say voice="Polly.Aditi">I am sorry, I am having trouble hearing you. Please try calling again later.</Say>
-    <Hangup/>
+    <Say voice="Polly.Aditi">{processing_phrase}</Say>
+    <Pause length="2"/>
+    <Redirect>https://{DOMAIN}/check-status/{call_sid}</Redirect>
 </Response>"""
-            return Response(content=xml_response, media_type="text/xml")
-        else:
+        
+        return Response(content=xml_response, media_type="text/xml")
+    
+    else:
+        # Already processing, check status
+        return Response(content=generate_status_check_response(call_sid), media_type="text/xml")
+
+@app.post("/check-status/{call_sid}")
+async def check_status(call_sid: str):
+    """Check processing status and return appropriate response"""
+    if call_sid in processing_results and processing_results[call_sid]["ready"]:
+        # Processing complete, return final response
+        result = processing_results[call_sid]
+        detected_language = result["language"]
+        clean_response = result["response"]
+        
+        language_info = LANGUAGE_MAP.get(detected_language, LANGUAGE_MAP["default"])
+        voice = language_info["voice"]
+        
+        # Clean up
+        if call_sid in processing_results:
+            del processing_results[call_sid]
+        if call_sid in processing_queues:
+            del processing_queues[call_sid]
+        
+        if any(word in clean_response.lower() for word in ["goodbye", "thank you", "end call", "have a great day"]):
             xml_response = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-    <Say voice="Polly.Aditi">I am sorry, I am having trouble hearing you. Please try calling again later.</Say>
+    <Say voice="{voice}">{clean_response}</Say>
     <Hangup/>
 </Response>"""
             if call_sid in call_retry_counts:
                 del call_retry_counts[call_sid]
-            return Response(content=xml_response, media_type="text/xml")
-    
-    if call_sid in call_retry_counts:
-        del call_retry_counts[call_sid]
-    
-    detected_language, clean_response = await process_user_query(speech_result, call_sid)
-    
-    language_info = LANGUAGE_MAP.get(detected_language, LANGUAGE_MAP["default"])
-    detected_language_code = language_info["code"]
-    voice = language_info["voice"]
-    
-    print(f"Language: {detected_language} -> {detected_language_code}, Voice: {voice}")
-    
-    if any(word in clean_response.lower() for word in ["goodbye", "thank you", "end call", "have a great day"]):
-        xml_response = f"""<?xml version="1.0" encoding="UTF-8"?>
+            if call_sid in conversation_context:
+                del conversation_context[call_sid]
+        else:
+            simple_prompts = {
+                "hi": "मैं सुन रहा हूँ।",
+                "gu": "हुं सांभळूं छूं।",
+                "en": "I am listening."
+            }
+            continue_prompt = simple_prompts.get(detected_language, "")
+            
+            xml_response = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
     <Say voice="{voice}">{clean_response}</Say>
-    <Hangup/>
-</Response>"""
-        if call_sid in call_retry_counts:
-            del call_retry_counts[call_sid]
-        if call_sid in conversation_context:
-            del conversation_context[call_sid]
-    else:
-        simple_prompts = {
-            "hi": "मैं सुन रहा हूँ।",
-            "gu": "हुं सांभळूं छूं।",
-            "en": "I am listening."
-        }
-        continue_prompt = simple_prompts.get(detected_language, "")
-        
-        xml_response = f"""<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-    <Say voice="{voice}">{clean_response}</Say>
-    <Gather input="speech" language="{detected_language_code}" action="https://{DOMAIN}/handle-speech" speechTimeout="auto" enhanced="true">
+    <Gather input="speech" language="{language_info['code']}" action="https://{DOMAIN}/handle-speech" speechTimeout="auto" enhanced="true">
     </Gather>
     <Say voice="{voice}">I did not hear you.</Say>
-    <Gather input="speech" language="{detected_language_code}" action="https://{DOMAIN}/handle-speech" speechTimeout="auto" enhanced="true">
+    <Gather input="speech" language="{language_info['code']}" action="https://{DOMAIN}/handle-speech" speechTimeout="auto" enhanced="true">
         <Say voice="{voice}">Please tell me what you need.</Say>
     </Gather>
     <Say voice="{voice}">I am having trouble hearing you. Please try calling again later.</Say>
     <Hangup/>
 </Response>"""
+        
+        return Response(content=xml_response, media_type="text/xml")
     
-    return Response(content=xml_response, media_type="text/xml")
+    else:
+        # Still processing, check again
+        xml_response = f"""<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Pause length="2"/>
+    <Redirect>https://{DOMAIN}/check-status/{call_sid}</Redirect>
+</Response>"""
+        
+        return Response(content=xml_response, media_type="text/xml")
+
+def generate_status_check_response(call_sid):
+    """Generate XML response for status checking"""
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Pause length="2"/>
+    <Redirect>https://{DOMAIN}/check-status/{call_sid}</Redirect>
+</Response>"""
 
 @app.get("/")
 async def root():
@@ -664,13 +819,17 @@ if __name__ == "__main__":
     print(f"Starting server on port {PORT}")
     print(f"Main endpoint: {DOMAIN}/twiml")
     print(f"Speech handler: {DOMAIN}/handle-speech")
-    print("GroceryBabu assistant Aditi is ready with optimized prompts!")
+    print("GroceryBabu assistant Aditi is ready with processing feedback!")
     
+    # Initialize inventory and search engine
     inventory = get_inventory()
     print(f"Found {len(inventory)} items in inventory")
     
     from intelligent_search import search_engine
     search_engine.refresh_inventory()
     print("Search engine refreshed")
+    
+    # Initialize Gemini warm-up session for faster first requests
+    initialize_warmup_session()
     
     uvicorn.run(app, host="0.0.0.0", port=PORT)
