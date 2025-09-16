@@ -49,9 +49,11 @@ def processing_worker(call_sid: str, user_input: str):
         
         q = processing_queues[call_sid]
         
+        # Use session language from previous interactions, fallback to global language
+        session_lang = get_session_language(call_sid) if call_sid in session_languages else current_language
+        
         # Send processing message in appropriate language
-        # Use global language as default, will be updated when language is detected
-        processing_phrase = get_processing_phrase(current_language)
+        processing_phrase = get_processing_phrase(session_lang)
         q.put({"type": "processing", "message": processing_phrase})
         
         # Simulate processing time (or use actual processing time)
@@ -208,9 +210,39 @@ call_retry_counts = {}
 current_language = "en"  # Default language
 session_languages = {}  # Track language per session
 
+# Warm-up session for faster first requests
+warmup_session = None
+
+def initialize_warmup_session():
+    """Initialize a warm-up Gemini session to reduce first request latency"""
+    global warmup_session
+    try:
+        print("DEBUG: Initializing Gemini warm-up session...")
+        model = genai.GenerativeModel(
+            model_name='gemini-1.5-flash',
+            tools=function_declarations
+        )
+        
+        warmup_session = model.start_chat(history=[])
+        
+        # Send system prompt to warm up the session
+        warmup_session.send_message(SYSTEM_PROMPT)
+        
+        # Send a simple test message to fully initialize
+        test_response = warmup_session.send_message("Hello, test message for initialization")
+        
+        print("DEBUG: Gemini warm-up session initialized successfully")
+        return True
+        
+    except Exception as e:
+        print(f"DEBUG: Warm-up session initialization failed: {e}")
+        warmup_session = None
+        return False
+
 def set_global_language(lang_code):
     """Set global language with fallback to English"""
     global current_language
+    print("DEBUG: Setting global language to", lang_code)
     if lang_code in ["en", "hi", "gu"]:
         current_language = lang_code
     else:
@@ -219,13 +251,18 @@ def set_global_language(lang_code):
 
 def get_session_language(call_sid):
     """Get language for specific session with fallback"""
+    print("DEBUG: Getting session language for", call_sid)
+    print("DEBUG: Session languages:", session_languages)
     return session_languages.get(call_sid, current_language)
 
 def set_session_language(call_sid, lang_code):
     """Set language for specific session"""
+    print("DEBUG: Setting session language for", call_sid, "to", lang_code)
     if lang_code in ["en", "hi", "gu"]:
+        print("DEBUG: Setting session language to", lang_code)
         session_languages[call_sid] = lang_code
     else:
+        print("DEBUG: Setting session language to default", current_language)
         session_languages[call_sid] = current_language
     return session_languages[call_sid]
 
@@ -311,19 +348,40 @@ def parse_language_response(response_text):
         clean_response = response_match.group(1).strip()
         return detected_language, clean_response
     
-    return "en", response_text
+    return None, response_text
 
 def initialize_session(call_sid):
-    """Initialize a new chat session with the system prompt"""
-    model = genai.GenerativeModel(
-        model_name='gemini-1.5-flash',
-        tools=function_declarations
-    )
+    """Initialize a new chat session with the system prompt (optimized with warm-up)"""
+    global warmup_session
     
-    sessions[call_sid] = model.start_chat(history=[])
-    
-    # Send system prompt as the first message
-    sessions[call_sid].send_message(SYSTEM_PROMPT)
+    # Try to use warm-up session for faster initialization
+    if warmup_session is not None:
+        try:
+            # Clone the warm-up session for this call
+            model = genai.GenerativeModel(
+                model_name='gemini-1.5-flash',
+                tools=function_declarations
+            )
+            sessions[call_sid] = model.start_chat(history=[])
+            sessions[call_sid].send_message(SYSTEM_PROMPT)
+            print(f"DEBUG: Fast session initialization for {call_sid}")
+        except Exception as e:
+            print(f"DEBUG: Fast initialization failed, using standard method: {e}")
+            # Fallback to standard initialization
+            model = genai.GenerativeModel(
+                model_name='gemini-1.5-flash',
+                tools=function_declarations
+            )
+            sessions[call_sid] = model.start_chat(history=[])
+            sessions[call_sid].send_message(SYSTEM_PROMPT)
+    else:
+        # Standard initialization
+        model = genai.GenerativeModel(
+            model_name='gemini-1.5-flash',
+            tools=function_declarations
+        )
+        sessions[call_sid] = model.start_chat(history=[])
+        sessions[call_sid].send_message(SYSTEM_PROMPT)
     
     # Load existing cart if available
     existing_cart = load_cart(call_sid)
@@ -380,6 +438,13 @@ Interpret the user's intent considering possible speech recognition errors."""
             
             print(f"DEBUG: Function call: {function_name} with args: {args}")
             
+            # Update global language immediately when detected by Gemini
+            if 'language' in args and args['language'] in ["en", "hi", "gu"]:
+                detected_lang = args['language']
+                set_global_language(detected_lang)
+                set_session_language(call_sid, detected_lang)
+                print(f"DEBUG: Updated global language to {detected_lang}")
+            
             if function_name == "search_products":
                 query = args.get("query", "")
                 lang_code = args.get("language", session_lang)
@@ -398,23 +463,23 @@ Interpret the user's intent considering possible speech recognition errors."""
                     if results:
                         if len(results) == 1:
                             item = results[0]
-                            response_text = get_localized_text("ask_quantity", lang_code, item=item['Item Name']) or f"I found {item['Item Name']} for ${item['Price (USD)']}. How many would you like?"
+                            response_text = get_localized_text("ask_quantity", lang_code, item=item['Item Name']) or f"I found {item['Item Name']}. How many would you like?"
                         elif len(results) > 5:
                             response_text = get_localized_text("product_found", lang_code, count=len(results), items="") or f"Found {len(results)} products. Popular ones: "
-                            for i, item in enumerate(results[:3], 1):
-                                response_text += f"{i}. {item['Item Name']} (${item['Price (USD)']}), "
+                            product_names = [item['Item Name'] for item in results[:3]]
+                            response_text += ", ".join(product_names) + ". "
                             response_text += get_localized_text("which_one", lang_code) or "Which one would you like?"
                         else:
                             response_text = get_localized_text("product_found", lang_code, count=len(results), items="") or "Found these products: "
-                            for i, item in enumerate(results[:3], 1):
-                                response_text += f"{i}. {item['Item Name']} (${item['Price (USD)']}), "
+                            product_names = [item['Item Name'] for item in results[:3]]
+                            response_text += ", ".join(product_names) + ". "
                             response_text += get_localized_text("which_one", lang_code) or "Which one would you like?"
                     else:
                         similar = find_similar_products(query)
                         if similar:
                             response_text = get_localized_text("no_products", lang_code, query=query) or f"No '{query}' found. Similar items: "
-                            for item in similar[:2]:
-                                response_text += f"{item['Item Name']} (${item['Price (USD)']}), "
+                            similar_names = [item['Item Name'] for item in similar[:2]]
+                            response_text += ", ".join(similar_names) + ". "
                             response_text += get_localized_text("which_interests", lang_code) or "Which one interests you?"
                         else:
                             categories = get_categories_summary()
@@ -452,7 +517,7 @@ Interpret the user's intent considering possible speech recognition errors."""
                     
                     if available_suggestions:
                         item = available_suggestions[0]
-                        suggestion_text = get_localized_text("suggest_item", lang_code, item=item['Item Name'], price=item['Price (USD)']) or f" Would you also like {item['Item Name']} for ${item['Price (USD)']}?"
+                        suggestion_text = get_localized_text("suggest_item", lang_code, item=item['Item Name']) or f" Would you also like {item['Item Name']}?"
                         response_text += suggestion_text
             
             elif function_name == "remove_from_cart":
@@ -531,10 +596,13 @@ Interpret the user's intent considering possible speech recognition errors."""
         
         detected_lang, clean_response = parse_language_response(response_text)
         
-        # Update session language if detected
+        # Update session language if detected, otherwise preserve current session language
         if detected_lang and detected_lang in ["en", "hi", "gu"]:
             set_session_language(call_sid, detected_lang)
             set_global_language(detected_lang)  # Update global language too
+        else:
+            # Use existing session language if no language detected in response
+            detected_lang = get_session_language(call_sid)
         
         add_to_conversation_history(call_sid, "assistant", clean_response)
         return detected_lang, clean_response
@@ -601,10 +669,13 @@ Interpret the user's intent considering possible speech recognition errors."""
         response_text = f"<language>{session_lang}</language><response>{response_text}</response>"
         detected_lang, clean_response = parse_language_response(response_text)
         
-        # Update session language if detected
+        # Update session language if detected, otherwise preserve current session language
         if detected_lang and detected_lang in ["en", "hi", "gu"]:
             set_session_language(call_sid, detected_lang)
             set_global_language(detected_lang)
+        else:
+            # Use existing session language if no language detected in response
+            detected_lang = get_session_language(call_sid)
         
         add_to_conversation_history(call_sid, "assistant", clean_response)
         return detected_lang, clean_response
@@ -750,11 +821,15 @@ if __name__ == "__main__":
     print(f"Speech handler: {DOMAIN}/handle-speech")
     print("GroceryBabu assistant Aditi is ready with processing feedback!")
     
+    # Initialize inventory and search engine
     inventory = get_inventory()
     print(f"Found {len(inventory)} items in inventory")
     
     from intelligent_search import search_engine
     search_engine.refresh_inventory()
     print("Search engine refreshed")
+    
+    # Initialize Gemini warm-up session for faster first requests
+    initialize_warmup_session()
     
     uvicorn.run(app, host="0.0.0.0", port=PORT)
