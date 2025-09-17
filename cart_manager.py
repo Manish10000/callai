@@ -211,7 +211,9 @@ def place_order(call_sid, customer_data, language="en"):
         delete_cart(call_sid)
         
         order_id = datetime.now().strftime("%Y%m%d%H%M%S")
-        return True, LANG["order_placed"][language].format(order_id=order_id)
+        order_message = LANG["order_placed"][language].format(order_id=order_id)
+        goodbye_message = LANG["goodbye"][language]
+        return True, f"{order_message} {goodbye_message}"
     
     except Exception as e:
         return False, f"Error placing order: {str(e)}"
